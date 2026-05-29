@@ -6,7 +6,7 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 2.0.0
+# xray-xhttp-manager.sh  ·  Version 2.1.0  (Android SSH Patched)
 # =============================================================================
 # Description : Automates the full lifecycle of Xray-core using the XHTTP
 #               transport protocol on Ubuntu 24.04 LTS.
@@ -15,83 +15,67 @@
 #               · Protocol : VLESS (zero-overhead, CDN-friendly)
 #               · CDN      : Cloudflare and compatible providers
 #
+# Patch notes : v2.1.0 — All read -rp replaced with separate echo + read -r
+#               for full compatibility with Android SSH apps (JuiceSSH,
+#               ConnectBot, Termius, etc.) that have broken readline PTYs.
+#
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
 # =============================================================================
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 1  ANSI COLOR CODES
-#      These escape sequences tell the terminal to render colored text.
-#      NC (No Color) always resets back to the default terminal color.
 # ─────────────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'        # Errors, destructive warnings
-GREEN='\033[0;32m'      # Success, healthy status
-YELLOW='\033[1;33m'     # Info, soft warnings, prompts
-BLUE='\033[0;34m'       # Decorative separators
-CYAN='\033[0;36m'       # Step headers, menu item numbers
-MAGENTA='\033[0;35m'    # Secondary highlights
-WHITE='\033[1;37m'      # Important values shown to the user
-BOLD='\033[1m'          # Bold (no color change)
-DIM='\033[2m'           # Dimmed / secondary text
-NC='\033[0m'            # Reset — must be used after every color block
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 2  GLOBAL CONSTANTS
-#      All tuneable paths and settings live here so they are easy to audit
-#      or customise without hunting through the code.
 # ─────────────────────────────────────────────────────────────────────────────
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONFIG_DIR="/usr/local/etc/xray"
+CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
+LOG_DIR="/var/log/xray"
+SERVICE_FILE="/etc/systemd/system/xray.service"
 
-# ── Xray binary & config paths ────────────────────────────────────────────────
-XRAY_BIN="/usr/local/bin/xray"               # Where the xray executable lives
-XRAY_CONFIG_DIR="/usr/local/etc/xray"        # All Xray configuration lives here
-CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json" # The main Xray JSON config
-LOG_DIR="/var/log/xray"                      # Runtime access + error logs
-SERVICE_FILE="/etc/systemd/system/xray.service"  # systemd unit definition
+DOMAIN_FILE="${XRAY_CONFIG_DIR}/.domain"
+PATH_FILE="${XRAY_CONFIG_DIR}/.xhttp_path"
 
-# ── Metadata files (written at install time, read later) ─────────────────────
-DOMAIN_FILE="${XRAY_CONFIG_DIR}/.domain"     # Stores the server's domain name
-PATH_FILE="${XRAY_CONFIG_DIR}/.xhttp_path"  # Stores the random XHTTP URL path
+CERT_DIR="/etc/ssl/xray"
+CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
+CERT_KEY="${CERT_DIR}/privkey.pem"
 
-# ── SSL certificate paths ─────────────────────────────────────────────────────
-CERT_DIR="/etc/ssl/xray"                     # Our cert storage directory
-CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"   # Full chain (cert + intermediates)
-CERT_KEY="${CERT_DIR}/privkey.pem"           # Private key (chmod 600)
+ACME_HOME="/root/.acme.sh"
+ACME_BIN="${ACME_HOME}/acme.sh"
 
-# ── ACME.sh paths ─────────────────────────────────────────────────────────────
-ACME_HOME="/root/.acme.sh"                   # acme.sh installs itself here
-ACME_BIN="${ACME_HOME}/acme.sh"              # The acme.sh executable
+PORT_TLS=443
+PORT_NTLS=80
 
-# ── Network ───────────────────────────────────────────────────────────────────
-PORT_TLS=443     # Direct TLS inbound (server terminates TLS with real cert)
-PORT_NTLS=80     # NTLS / CDN-mode inbound (CDN terminates TLS from the client)
-
-# ── GitHub release API ────────────────────────────────────────────────────────
 XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 XRAY_DL_BASE="https://github.com/XTLS/Xray-core/releases/download"
 
-# ── Installer log (captures all command stdout/stderr for debugging) ──────────
 INSTALL_LOG="/var/log/xray_install.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 3  HELPER / UTILITY FUNCTIONS
-#      Small, reusable building blocks used throughout the script.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Prints a horizontal rule for visual separation
 separator() {
     echo -e "${BLUE}  ──────────────────────────────────────────────────────────────  ${NC}"
 }
 
-# msg_info TEXT  — Yellow informational message
 msg_info() { echo -e "${YELLOW}  [INFO]  ${NC}${1}"; }
-
-# msg_ok TEXT    — Green success message
 msg_ok()   { echo -e "${GREEN}  [OK]    ${NC}${1}"; }
-
-# msg_warn TEXT  — Yellow warning (non-fatal)
 msg_warn() { echo -e "${YELLOW}  [WARN]  ${NC}${1}"; }
 
-# msg_err TEXT [exit] — Red error. Pass "exit" as $2 to terminate the script.
 msg_err() {
     echo -e "${RED}  [ERROR] ${NC}${1}" >&2
     if [[ "${2:-}" == "exit" ]]; then
@@ -100,45 +84,36 @@ msg_err() {
     fi
 }
 
-# msg_step TEXT  — Cyan bold header announcing a new phase
 msg_step() {
     echo ""
     echo -e "${CYAN}${BOLD}  ▶  ${1}${NC}"
     echo ""
 }
 
-# cmd_exists CMD — Returns 0 if CMD is found in PATH, 1 otherwise.
-# Usage: if cmd_exists jq; then ...
 cmd_exists() { command -v "$1" &>/dev/null; }
 
-# is_xray_installed — Returns 0 if Xray binary + config both exist
 is_xray_installed() {
     [[ -f "${XRAY_BIN}" ]] && [[ -f "${CONFIG_FILE}" ]]
 }
 
-# is_port_in_use PORT — Returns 0 if the TCP port is currently bound.
-# 'ss' (socket statistics) is the modern, built-in replacement for netstat.
-#  -t = TCP only | -l = listening sockets | -n = numeric (no DNS lookups)
 is_port_in_use() {
     ss -tln 2>/dev/null | grep -q ":${1} "
 }
 
-# press_enter — Pauses the script until the operator hits Enter.
+# ─────────────────────────────────────────────────────────────────────────────
+# press_enter — patched: uses plain 'read -r' (no -p flag) for Android compat
+# ─────────────────────────────────────────────────────────────────────────────
 press_enter() {
     echo ""
-    read -rp "  Press Enter to return to the main menu..."
+    echo -e "  ${YELLOW}Press Enter to return to the main menu...${NC}"
+    read -r _DUMMY
 }
 
-# urlencode STRING — URL-encodes a string using Python 3's urllib.
-# Python 3 ships by default on Ubuntu 24.04; this is safer than regex sed.
 urlencode() {
     python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip()))" \
         <<< "${1}"
 }
 
-# safe_exec DESCRIPTION CMD [ARGS...] — Runs a command and exits on failure.
-# All output is redirected to INSTALL_LOG to keep the terminal clean while
-# still giving the administrator a full audit trail if something goes wrong.
 safe_exec() {
     local description="${1}"
     shift
@@ -153,7 +128,6 @@ safe_exec() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 4  MAIN BANNER
-#      Printed at the top of every menu page for a consistent look.
 # ─────────────────────────────────────────────────────────────────────────────
 
 print_banner() {
@@ -173,7 +147,6 @@ print_banner() {
     echo "  ╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
-    # Dynamic status line — shows Xray state and domain if already installed
     if is_xray_installed; then
         local svc_status
         svc_status="$(systemctl is-active xray 2>/dev/null || echo 'unknown')"
@@ -192,11 +165,8 @@ print_banner() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 5  PRE-FLIGHT CHECKS
-#      Run unconditionally before the menu appears. Fatal on failure.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Ensures the script is run with effective UID 0 (root).
-# Binding to ports < 1024 and writing to /etc / /usr require root.
 check_root() {
     if [[ "${EUID}" -ne 0 ]]; then
         echo -e "${RED}[FATAL] This script must be run as root.${NC}"
@@ -205,20 +175,13 @@ check_root() {
     fi
 }
 
-# Reads /etc/os-release (the standard Linux OS identification file) and
-# verifies that we are on exactly Ubuntu 24.04. The script uses systemd
-# unit features and apt package names specific to this release.
 check_ubuntu_2404() {
     if [[ ! -f /etc/os-release ]]; then
         echo -e "${RED}[FATAL] /etc/os-release not found — cannot determine OS.${NC}"
         exit 1
     fi
-
-    # 'source' imports the key=value pairs from os-release as shell variables:
-    # ID, VERSION_ID, PRETTY_NAME, etc.
     # shellcheck source=/dev/null
     source /etc/os-release
-
     if [[ "${ID:-}" != "ubuntu" ]] || [[ "${VERSION_ID:-}" != "24.04" ]]; then
         echo -e "${RED}[FATAL] This script requires Ubuntu 24.04 LTS.${NC}"
         echo -e "        Detected: ${WHITE}${PRETTY_NAME:-Unknown OS}${NC}"
@@ -227,19 +190,14 @@ check_ubuntu_2404() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# § 6  INSTALL — PRE-CHECKS (called inside install_xray)
-#      Negative constraints: abort if a conflicting web server owns port 80/443.
+# § 6  INSTALL — WEB SERVER CONFLICT CHECK
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Scans for known web server systemd services that would conflict with Xray.
-# We check the service state rather than just port occupancy so the error
-# message can name the exact culprit for the operator.
 check_webserver_conflict() {
     local -a CONFLICT_SERVICES=("nginx" "apache2" "apache" "lighttpd" "caddy" "httpd")
     local -a found=()
 
     for svc in "${CONFLICT_SERVICES[@]}"; do
-        # 'systemctl is-active --quiet' exits 0 if the unit is active (running)
         if systemctl is-active --quiet "${svc}" 2>/dev/null; then
             found+=("${svc}")
         fi
@@ -262,15 +220,12 @@ check_webserver_conflict() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 7  INSTALL FUNCTION  (Menu option 1)
-#      Full installation: deps → acme.sh → SSL cert → Xray binary
-#      → config.json (dual inbounds) → systemd → UFW
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_xray() {
     print_banner
     msg_step "OPTION 1 — Install Xray-core (XHTTP + CDN Optimised)"
 
-    # ── Guard: Prevent double-installation ────────────────────────────────────
     if is_xray_installed; then
         msg_warn "Xray is already installed on this system."
         msg_info  "To reinstall, run Option 5 (Uninstall) first, then re-run Option 1."
@@ -281,10 +236,8 @@ install_xray() {
     # ── Step 1: Port and web-server conflict checks ────────────────────────────
     msg_step "Step 1/9 — Checking for port and service conflicts"
 
-    # Check for running web servers by service name first (gives better errors)
     check_webserver_conflict
 
-    # Also check raw port occupancy — catches non-systemd processes too
     if is_port_in_use 80; then
         msg_err "Port 80 is already in use by an unknown process."
         msg_err "Identify it with: ${WHITE}sudo ss -tlnp | grep ':80 '${NC}"
@@ -313,15 +266,15 @@ install_xray() {
     echo -e "     during installation so the ACME challenge can reach this server."
     echo -e "   • You can re-enable the orange cloud AFTER the certificate is issued."
     echo ""
-    read -rp "  Domain name: " DOMAIN
+    # ── PATCHED: echo prompt separately, then plain read -r ──────────────────
+    echo -e "  ${YELLOW}Domain name:${NC} "
+    read -r DOMAIN
 
-    # Strip accidental http:// or https:// prefix and any trailing path
     DOMAIN="${DOMAIN#http://}"
     DOMAIN="${DOMAIN#https://}"
     DOMAIN="${DOMAIN%%/*}"
-    DOMAIN="${DOMAIN%% *}"   # Remove leading/trailing whitespace
+    DOMAIN="${DOMAIN%% *}"
 
-    # Validate: must contain at least one dot and no illegal characters
     if [[ -z "${DOMAIN}" ]] || [[ "${DOMAIN}" != *.* ]] || \
        [[ "${DOMAIN}" =~ [[:space:]] ]]; then
         msg_err "Invalid domain name '${DOMAIN}'. Must be a valid FQDN (e.g. vpn.example.com)." "exit"
@@ -331,14 +284,10 @@ install_xray() {
     # ── Step 3: DNS resolution check ──────────────────────────────────────────
     msg_step "Step 3/9 — DNS resolution check"
 
-    # Determine the public IPv4 of THIS server using an external echo service.
-    # We try ipify first (reliable, returns just the IP), then fall back to ifconfig.me.
     SERVER_IP="$(curl -s -4 --connect-timeout 8 https://api.ipify.org 2>/dev/null || \
                  curl -s -4 --connect-timeout 8 https://ifconfig.me 2>/dev/null  || \
                  echo 'unknown')"
 
-    # Resolve the domain's A record. 'dig +short' prints only the answer value.
-    # We grep for a valid IPv4 pattern to ignore any CNAME chain output.
     DOMAIN_IP="$(dig +short A "${DOMAIN}" 2>/dev/null | \
                  grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || echo '')"
 
@@ -358,10 +307,11 @@ install_xray() {
     fi
 
     echo ""
-    read -rp "  Continue with domain '${DOMAIN}'? [Y/n]: " DNS_CONFIRM
+    # ── PATCHED ───────────────────────────────────────────────────────────────
+    echo -e "  ${YELLOW}Continue with domain '${DOMAIN}'? [Y/n]:${NC} "
+    read -r DNS_CONFIRM
     [[ "${DNS_CONFIRM,,}" == "n" ]] && { msg_info "Installation cancelled."; press_enter; return; }
 
-    # Initialise the install log (appended to by safe_exec throughout)
     mkdir -p "$(dirname "${INSTALL_LOG}")"
     {
         echo "=== Xray Install Log — $(date) ==="
@@ -372,24 +322,12 @@ install_xray() {
     # ── Step 4: System dependencies ───────────────────────────────────────────
     msg_step "Step 4/9 — Installing system dependencies"
 
-    # Update package metadata so apt can find the latest versions of packages.
-    # Failing here usually means no internet or a broken apt mirror.
     msg_info "Running apt-get update..."
     if ! apt-get update -y >>"${INSTALL_LOG}" 2>&1; then
         msg_err "apt-get update failed. Check your internet connection." "exit"
     fi
     msg_ok "Package lists updated."
 
-    # Package list with a brief rationale for each:
-    #   curl        — download files from URLs (GitHub releases, ACME scripts)
-    #   wget        — alternative downloader used by some helper scripts
-    #   unzip       — extract the Xray-core ZIP archive
-    #   jq          — parse and modify JSON (critical for config management)
-    #   uuid-runtime — provides 'uuidgen' to generate RFC-4122 UUIDs for users
-    #   socat       — TCP relay used by acme.sh for TLS-ALPN-01 challenges
-    #   dnsutils    — provides 'dig' for DNS lookups
-    #   qrencode    — render QR codes in the terminal (ANSI UTF-8 mode)
-    #   openssl     — inspect SSL certificate metadata in the status check
     local -a DEPS=("curl" "wget" "unzip" "jq" "uuid-runtime" \
                    "socat" "dnsutils" "qrencode" "openssl")
 
@@ -412,9 +350,6 @@ install_xray() {
         msg_ok "acme.sh is already installed at ${ACME_HOME}."
     else
         msg_info "Downloading acme.sh from https://get.acme.sh ..."
-        # acme.sh is a pure-shell ACME v2 client — no dependencies beyond bash + curl.
-        # The installer: creates ~/.acme.sh/, copies itself, and installs a cron job
-        # that auto-renews certs before they expire (Let's Encrypt certs last 90 days).
         if ! curl -fsSL "https://get.acme.sh" | bash -s -- \
              --install-online \
              --accountemail "admin@${DOMAIN}" >>"${INSTALL_LOG}" 2>&1; then
@@ -423,8 +358,6 @@ install_xray() {
         msg_ok "acme.sh installed to ${ACME_HOME}."
     fi
 
-    # Force Let's Encrypt as the Certificate Authority.
-    # (acme.sh defaults to ZeroSSL which requires email verification.)
     msg_info "Setting Certificate Authority to Let's Encrypt..."
     "${ACME_BIN}" --set-default-ca --server letsencrypt >>"${INSTALL_LOG}" 2>&1 || true
     msg_ok "CA set: Let's Encrypt."
@@ -439,16 +372,13 @@ install_xray() {
     echo -e "   • Port 80 must be reachable from the internet (no firewall block)."
     echo -e "   • The domain must point directly to THIS server (no CDN proxy)."
     echo ""
-    read -rp "  Ready to issue certificate? [Y/n]: " CERT_CONFIRM
+    # ── PATCHED ───────────────────────────────────────────────────────────────
+    echo -e "  ${YELLOW}Ready to issue certificate? [Y/n]:${NC} "
+    read -r CERT_CONFIRM
     [[ "${CERT_CONFIRM,,}" == "n" ]] && { msg_info "Installation cancelled."; press_enter; return; }
 
     mkdir -p "${CERT_DIR}"
 
-    # Issue the certificate:
-    #   --issue          — request a brand-new certificate
-    #   --standalone     — acme.sh runs its own temporary HTTP server (port 80)
-    #   -d ${DOMAIN}     — the domain to get certified
-    #   --keylength ec-256 — ECDSA P-256 key (faster, shorter, modern standard)
     msg_info "Issuing certificate (this takes ~30–60 seconds)..."
     if ! "${ACME_BIN}" --issue --standalone -d "${DOMAIN}" \
          --keylength ec-256 >>"${INSTALL_LOG}" 2>&1; then
@@ -471,11 +401,6 @@ install_xray() {
     fi
     msg_ok "Certificate issued."
 
-    # Install (copy) the certificate files to our managed directory.
-    # We also register hooks so that on every automatic renewal:
-    #   --pre-hook  stops  Xray (releasing port 80 for the standalone challenge)
-    #   --post-hook starts Xray again after the new cert is in place.
-    # This enables fully hands-free 90-day renewal forever.
     msg_info "Installing certificate to ${CERT_DIR}..."
     if ! "${ACME_BIN}" --install-cert -d "${DOMAIN}" --ecc \
          --key-file       "${CERT_KEY}"        \
@@ -486,7 +411,6 @@ install_xray() {
         msg_err "Certificate installation (copy) failed. See ${INSTALL_LOG}." "exit"
     fi
 
-    # Harden private key permissions — only root may read it
     chmod 600 "${CERT_KEY}"
     chmod 644 "${CERT_FULLCHAIN}"
     msg_ok "Certificate installed to ${CERT_DIR}. Auto-renewal hooks registered."
@@ -494,8 +418,6 @@ install_xray() {
     # ── Step 7: Download and install Xray-core ────────────────────────────────
     msg_step "Step 7/9 — Downloading and installing Xray-core"
 
-    # Detect CPU architecture so we download the correct binary variant.
-    # 'uname -m' returns the hardware class: x86_64, aarch64, armv7l, etc.
     local ARCH
     ARCH="$(uname -m)"
     local XRAY_ARCH
@@ -505,13 +427,11 @@ install_xray() {
         armv7l)        XRAY_ARCH="arm32-v7a"  ;;
         armv6l)        XRAY_ARCH="arm32-v6"   ;;
         *)
-            msg_err "Unsupported CPU architecture: ${ARCH}. " "exit"
+            msg_err "Unsupported CPU architecture: ${ARCH}." "exit"
             ;;
     esac
     msg_ok "Architecture detected: ${ARCH}  →  Package: Xray-linux-${XRAY_ARCH}"
 
-    # Query the GitHub Releases API to find the latest Xray tag name.
-    # The API returns JSON; 'jq -r .tag_name' extracts just the version string.
     msg_info "Querying GitHub API for the latest Xray-core release..."
     local XRAY_VERSION
     XRAY_VERSION="$(curl -s --connect-timeout 10 "${XRAY_RELEASE_API}" 2>/dev/null \
@@ -532,79 +452,41 @@ install_xray() {
     fi
     msg_ok "Download complete."
 
-    # Extract the ZIP.  Xray archives contain:
-    #   xray            — the main binary
-    #   geoip.dat       — IP-to-country database (used by routing rules)
-    #   geosite.dat     — domain category database (used by routing rules)
     local XRAY_EXTRACT="/tmp/xray-extract-$$"
     mkdir -p "${XRAY_EXTRACT}"
     if ! unzip -o "${XRAY_ZIP}" -d "${XRAY_EXTRACT}" >>"${INSTALL_LOG}" 2>&1; then
         msg_err "Failed to extract ${XRAY_ZIP}." "exit"
     fi
 
-    # 'install -m 755' copies the file and sets execute permissions atomically
     install -m 755 "${XRAY_EXTRACT}/xray" "${XRAY_BIN}"
     msg_ok "Xray binary installed: ${XRAY_BIN}"
 
-    # The geo-data files must live in the same directory as config.json
-    # (or the directory specified by the 'asset' config key — default is config dir)
     mkdir -p "${XRAY_CONFIG_DIR}"
     [[ -f "${XRAY_EXTRACT}/geoip.dat"   ]] && cp "${XRAY_EXTRACT}/geoip.dat"   "${XRAY_CONFIG_DIR}/"
     [[ -f "${XRAY_EXTRACT}/geosite.dat" ]] && cp "${XRAY_EXTRACT}/geosite.dat" "${XRAY_CONFIG_DIR}/"
     msg_ok "Geo-data files installed."
 
-    # Tidy up temp files
     rm -rf "${XRAY_EXTRACT}" "${XRAY_ZIP}"
 
-    # ── Step 8: Generate random XHTTP path ────────────────────────────────────
-    # A random path prevents casual scanners from identifying this as an Xray
-    # endpoint. 'tr -dc' deletes all characters NOT in the specified set;
-    # 'head -c 12' takes the first 12 characters.
+    # ── Step 8: Generate random XHTTP path and write config ───────────────────
     local XHTTP_PATH
     XHTTP_PATH="/$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
     msg_ok "Generated XHTTP path: ${WHITE}${XHTTP_PATH}${NC}"
 
-    # ── Step 8: Create the initial user ───────────────────────────────────────
     msg_step "Step 8/9 — Creating configuration files"
 
     mkdir -p "${XRAY_CONFIG_DIR}" "${LOG_DIR}" "${CERT_DIR}"
     touch "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
     chmod 640 "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
 
-    # Persist domain + path so other menu functions can read them at any time
     echo "${DOMAIN}"      > "${DOMAIN_FILE}"
     echo "${XHTTP_PATH}" > "${PATH_FILE}"
 
-    # Generate the first user's UUID (RFC-4122 random UUID via uuidgen)
     local INIT_UUID INIT_USER
     INIT_UUID="$(uuidgen)"
     INIT_USER="user01"
     msg_ok "Initial user: ${WHITE}${INIT_USER}${NC}  UUID: ${WHITE}${INIT_UUID}${NC}"
 
-    # Write the main config.json.  The heredoc uses double-quotes (not <<'EOF')
-    # so that shell variables (DOMAIN, XHTTP_PATH, INIT_UUID, etc.) expand here.
-    #
-    # Config architecture:
-    # ┌──────────────────────────────────────────────────────────┐
-    # │  INBOUND 1  — tag: xhttp-ntls-p80                       │
-    # │    Port     : 80                                         │
-    # │    Security : none  (TLS is handled upstream by the CDN) │
-    # │    Use-case : Cloudflare orange-cloud proxy mode         │
-    # │               Client→CF (HTTPS/443)→Origin (HTTP/80)    │
-    # ├──────────────────────────────────────────────────────────┤
-    # │  INBOUND 2  — tag: xhttp-tls-p443                       │
-    # │    Port     : 443                                        │
-    # │    Security : tls (Let's Encrypt EC-256 certificate)     │
-    # │    Use-case : Direct connection without CDN proxy        │
-    # │               Also works with Cloudflare Full-Strict SSL │
-    # ├──────────────────────────────────────────────────────────┤
-    # │  OUTBOUNDS                                               │
-    # │    freedom  → route client traffic to the internet       │
-    # │    blackhole→ silently drop blocked destinations         │
-    # ├──────────────────────────────────────────────────────────┤
-    # │  ROUTING                                                 │
-    # │    Block private/LAN IPs → prevent SSRF attacks          │
-    # └──────────────────────────────────────────────────────────┘
     cat > "${CONFIG_FILE}" << EOF
 {
   "log": {
@@ -742,16 +624,6 @@ EOF
     # ── Step 9: systemd service + firewall ────────────────────────────────────
     msg_step "Step 9/9 — Creating systemd service and configuring firewall"
 
-    # The systemd unit file controls how the OS manages the Xray process:
-    #   After=network.target      — wait for networking before starting
-    #   CAP_NET_BIND_SERVICE      — allows binding to ports < 1024 (80, 443)
-    #   CAP_NET_ADMIN             — allows TProxy / raw-socket routing features
-    #   NoNewPrivileges=true      — the process cannot gain additional privileges
-    #   LimitNOFILE=1000000       — raise the open-file-descriptor limit for
-    #                               high-concurrency scenarios
-    #   Restart=on-failure        — systemd restarts Xray if it crashes
-    #   RestartPreventExitStatus=23 — exit code 23 means "do NOT auto-restart"
-    #                                 (Xray uses this for config parse errors)
     cat > "${SERVICE_FILE}" << 'SYSTEMD_EOF'
 [Unit]
 Description=Xray-core (VLESS+XHTTP Transport)
@@ -777,17 +649,13 @@ SYSTEMD_EOF
 
     msg_ok "systemd unit written: ${SERVICE_FILE}"
 
-    # 'daemon-reload' tells systemd to re-scan unit files on disk.
-    # Must be called after adding or modifying a .service file.
     systemctl daemon-reload
 
-    # 'enable' creates symlinks so Xray starts automatically on every boot
     if ! systemctl enable xray >>"${INSTALL_LOG}" 2>&1; then
         msg_err "Failed to enable xray service." "exit"
     fi
     msg_ok "Xray enabled (starts on boot)."
 
-    # 'start' launches the service right now
     if ! systemctl start xray; then
         msg_err "Xray failed to start immediately."
         msg_err "Diagnose with: ${WHITE}journalctl -u xray -n 50 --no-pager${NC}"
@@ -796,7 +664,6 @@ SYSTEMD_EOF
         return
     fi
 
-    # Brief pause — give systemd time to report the actual running state
     sleep 2
 
     if systemctl is-active --quiet xray; then
@@ -805,7 +672,6 @@ SYSTEMD_EOF
         msg_warn "Xray was started but may have stopped — run Option 4 to investigate."
     fi
 
-    # UFW (Uncomplicated Firewall) — open the required ports if ufw is present
     if cmd_exists ufw; then
         ufw allow OpenSSH              >>"${INSTALL_LOG}" 2>&1 || true
         ufw allow 80/tcp  comment 'Xray XHTTP NTLS (CDN mode)' \
@@ -817,7 +683,6 @@ SYSTEMD_EOF
         msg_warn "UFW not found. Manually open ports 80 and 443 in your cloud firewall."
     fi
 
-    # ── Summary ───────────────────────────────────────────────────────────────
     separator
     echo ""
     echo -e "${GREEN}${BOLD}  ✔  Installation complete!${NC}"
@@ -839,8 +704,6 @@ SYSTEMD_EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 8  ADD USER  (Menu option 2)
-#      Generates a new UUID, validates the username, and atomically inserts
-#      the new client entry into BOTH inbounds using jq.
 # ─────────────────────────────────────────────────────────────────────────────
 
 add_user() {
@@ -856,17 +719,16 @@ add_user() {
     echo ""
     echo -e "  ${WHITE}Username rules:${NC} letters, numbers, hyphens, and underscores only."
     echo ""
-    read -rp "  New username: " USERNAME
+    # ── PATCHED ───────────────────────────────────────────────────────────────
+    echo -e "  ${YELLOW}New username:${NC} "
+    read -r USERNAME
 
-    # Validate — only [a-zA-Z0-9_-] and non-empty
     if [[ -z "${USERNAME}" ]] || [[ "${USERNAME}" =~ [^a-zA-Z0-9_-] ]]; then
         msg_err "Invalid username '${USERNAME}'. Allowed chars: a-z A-Z 0-9 _ -"
         press_enter
         return
     fi
 
-    # Check for duplicate — jq -e returns exit code 1 when the result is false/null
-    # We select any client whose .email equals $USERNAME; if none, jq -e exits 1.
     if jq -e --arg em "${USERNAME}" \
           '.inbounds[0].settings.clients[] | select(.email == $em)' \
           "${CONFIG_FILE}" >/dev/null 2>&1; then
@@ -875,18 +737,10 @@ add_user() {
         return
     fi
 
-    # Generate a fresh UUID (universally unique identifier) for this user.
-    # VLESS identifies each client by its UUID — no username is sent on the wire.
     local NEW_UUID
     NEW_UUID="$(uuidgen)"
     msg_info "Generated UUID: ${WHITE}${NEW_UUID}${NC}"
 
-    # Atomically update config.json with jq:
-    #   (.inbounds[] | .settings.clients)   — navigate to every inbound's client list
-    #   += [{"id": $uuid, "email": $em, "flow": ""}]  — append the new user object
-    #
-    # We write to a temp file first, verify it is valid JSON, then replace the
-    # original.  This prevents a corrupted config.json if jq or mv is interrupted.
     local TMP_CFG
     TMP_CFG="$(mktemp)"
 
@@ -895,7 +749,6 @@ add_user() {
        '(.inbounds[] | .settings.clients) += [{"id": $uuid, "email": $em, "flow": ""}]' \
        "${CONFIG_FILE}" > "${TMP_CFG}"; then
 
-        # Sanity-check the output before overwriting the live config
         if jq empty "${TMP_CFG}" 2>/dev/null; then
             mv "${TMP_CFG}" "${CONFIG_FILE}"
             msg_ok "User '${USERNAME}' added to both port-80 and port-443 inbounds."
@@ -912,8 +765,6 @@ add_user() {
         return
     fi
 
-    # Reload Xray to apply the updated config.
-    # 'restart' is used rather than 'reload' because Xray re-reads config on restart.
     msg_info "Restarting Xray to apply new user..."
     if systemctl restart xray; then
         msg_ok "Xray restarted. User '${USERNAME}' is now active."
@@ -932,11 +783,6 @@ add_user() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 9  VIEW CLIENT CONFIG  (Menu option 3)
-#      Lists all users, lets the operator pick one, then displays:
-#        • CDN mode URL  (client → Cloudflare 443 → origin port 80)
-#        • Direct TLS URL (client → origin port 443)
-#        • NTLS URL      (port 80, unencrypted — testing only)
-#      Each URL is followed by an in-terminal QR code (if qrencode is installed).
 # ─────────────────────────────────────────────────────────────────────────────
 
 view_client_config() {
@@ -959,8 +805,6 @@ view_client_config() {
     DOMAIN="$(cat "${DOMAIN_FILE}")"
     XHTTP_PATH="$(cat "${PATH_FILE}")"
 
-    # Read all user email/names from the first inbound's clients array.
-    # 'mapfile -t' reads lines from stdin into a bash indexed array.
     local -a USERS
     mapfile -t USERS < <(jq -r '.inbounds[0].settings.clients[].email' \
                           "${CONFIG_FILE}" 2>/dev/null)
@@ -979,9 +823,10 @@ view_client_config() {
     done
     echo ""
 
-    read -rp "  Select user number [1-${#USERS[@]}]: " USER_NUM
+    # ── PATCHED ───────────────────────────────────────────────────────────────
+    echo -e "  ${YELLOW}Select user number [1-${#USERS[@]}]:${NC} "
+    read -r USER_NUM
 
-    # Validate that the input is a number within range
     if ! [[ "${USER_NUM}" =~ ^[0-9]+$ ]] || \
        [[ "${USER_NUM}" -lt 1 ]] || \
        [[ "${USER_NUM}" -gt "${#USERS[@]}" ]]; then
@@ -993,7 +838,6 @@ view_client_config() {
     local SELECTED_USER USER_UUID
     SELECTED_USER="${USERS[$((USER_NUM-1))]}"
 
-    # Retrieve the UUID for the chosen user by matching on the .email field
     USER_UUID="$(jq -r --arg em "${SELECTED_USER}" \
         '.inbounds[0].settings.clients[] | select(.email == $em) | .id' \
         "${CONFIG_FILE}")"
@@ -1004,29 +848,10 @@ view_client_config() {
         return
     fi
 
-    # URL-encode the path.  The path starts with '/' which becomes '%2F' in a
-    # query-string parameter, as required by VLESS URI spec.
     local PATH_ENC
     PATH_ENC="$(urlencode "${XHTTP_PATH}")"
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # VLESS URI format:
-    #   vless://UUID@HOST:PORT?param=value&...#REMARK
-    #
-    # Parameters relevant to XHTTP:
-    #   type=xhttp          transport type (tells the client to use XHTTP)
-    #   path=PATH_ENCODED   the XHTTP URL path (URL-encoded)
-    #   host=DOMAIN         the HTTP Host header value (required for CDN routing)
-    #   security=tls|none   whether to wrap the XHTTP stream in TLS
-    #   sni=DOMAIN          TLS SNI (must match the certificate's CN/SAN)
-    #   fp=chrome           TLS ClientHello fingerprint (mimics Chrome for evasion)
-    #   encryption=none     VLESS carries no additional encryption layer
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # Config A — CDN Mode
-    # The CLIENT connects to port 443 with TLS (to Cloudflare).
-    # Cloudflare decrypts the TLS and forwards plain HTTP to OUR port 80.
-    # The server-side inbound "xhttp-ntls-p80" receives the connection.
+    # CDN Mode URL — client → Cloudflare 443 → origin port 80
     local CDN_URL
     CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
     CDN_URL+="?encryption=none"
@@ -1038,10 +863,7 @@ view_client_config() {
     CDN_URL+="&fp=chrome"
     CDN_URL+="#${SELECTED_USER}-CDN"
 
-    # Config B — Direct TLS Mode
-    # The CLIENT connects to port 443 with TLS directly to THIS server.
-    # The server-side inbound "xhttp-tls-p443" terminates TLS with the LE cert.
-    # Use this when Cloudflare proxy is disabled (grey cloud / DNS-only).
+    # Direct TLS URL — client → origin port 443
     local DIRECT_URL
     DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
     DIRECT_URL+="?encryption=none"
@@ -1053,8 +875,7 @@ view_client_config() {
     DIRECT_URL+="&fp=chrome"
     DIRECT_URL+="#${SELECTED_USER}-Direct-TLS"
 
-    # Config C — NTLS Direct (unencrypted, port 80)
-    # FOR TESTING ONLY — traffic travels in plain text.  Never use in production.
+    # NTLS Direct URL — port 80, unencrypted (testing only)
     local NTLS_URL
     NTLS_URL="vless://${USER_UUID}@${DOMAIN}:80"
     NTLS_URL+="?encryption=none"
@@ -1064,7 +885,6 @@ view_client_config() {
     NTLS_URL+="&security=none"
     NTLS_URL+="#${SELECTED_USER}-NTLS-TestOnly"
 
-    # ── Display ───────────────────────────────────────────────────────────────
     clear
     echo ""
     separator
@@ -1075,7 +895,6 @@ view_client_config() {
     echo -e "  ${WHITE}XHTTP Path:${NC} ${XHTTP_PATH}"
     echo ""
 
-    # ── Config A: CDN Mode ────────────────────────────────────────────────────
     separator
     echo -e "  ${GREEN}${BOLD}[A]  CDN MODE  — Port 443 via Cloudflare → Origin Port 80${NC}"
     echo ""
@@ -1090,12 +909,10 @@ view_client_config() {
     if cmd_exists qrencode; then
         echo -e "  ${WHITE}QR Code (CDN Mode):${NC}"
         echo ""
-        # -t ANSIUTF8 renders the QR code using coloured Unicode block characters
         qrencode -t ANSIUTF8 -m 2 "${CDN_URL}"
         echo ""
     fi
 
-    # ── Config B: Direct TLS ──────────────────────────────────────────────────
     separator
     echo -e "  ${GREEN}${BOLD}[B]  DIRECT TLS — Port 443 (Let's Encrypt, no CDN proxy)${NC}"
     echo ""
@@ -1114,7 +931,6 @@ view_client_config() {
         echo ""
     fi
 
-    # ── Config C: NTLS test ───────────────────────────────────────────────────
     separator
     echo -e "  ${MAGENTA}${BOLD}[C]  NTLS DIRECT — Port 80 (Unencrypted — TESTING ONLY)${NC}"
     echo ""
@@ -1137,8 +953,6 @@ view_client_config() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 10  CHECK STATUS  (Menu option 4)
-#       Displays: systemctl unit info, port occupancy, user list,
-#       SSL cert validity, and the tail of the Xray error log.
 # ─────────────────────────────────────────────────────────────────────────────
 
 check_status() {
@@ -1148,11 +962,8 @@ check_status() {
     separator
     echo ""
 
-    # ── [1] Systemd service status ────────────────────────────────────────────
     echo -e "  ${WHITE}${BOLD}[ 1 ]  Xray Systemd Service${NC}"
     echo ""
-    # --no-pager prevents piping to less/more so output stays in the terminal
-    # -l prevents line-wrapping truncation in narrow terminals
     systemctl status xray --no-pager -l 2>/dev/null || \
         echo -e "  ${RED}xray.service not found in systemd.${NC}"
 
@@ -1160,13 +971,9 @@ check_status() {
     separator
     echo ""
 
-    # ── [2] Port listening check ──────────────────────────────────────────────
     echo -e "  ${WHITE}${BOLD}[ 2 ]  Port Listening Status${NC}"
     echo ""
 
-    # 'ss -tlnp' — TCP, listening, numeric, show process name
-    # We grep for the exact port string ":PORT " (space after port avoids
-    # false matches like :8080 matching :80).
     local P80_INFO P443_INFO
     P80_INFO="$(ss -tlnp 2>/dev/null | grep ':80 ' || echo '')"
     P443_INFO="$(ss -tlnp 2>/dev/null | grep ':443 ' || echo '')"
@@ -1189,7 +996,6 @@ check_status() {
     separator
     echo ""
 
-    # ── [3] Configuration summary ─────────────────────────────────────────────
     echo -e "  ${WHITE}${BOLD}[ 3 ]  Configuration Summary${NC}"
     echo ""
 
@@ -1206,14 +1012,12 @@ check_status() {
 
         if [[ "${USER_COUNT}" -gt 0 ]]; then
             echo -e "  User list   :"
-            # Produce a formatted table: index → username [uuid]
             jq -r '.inbounds[0].settings.clients |
                    to_entries[] |
                    "    \(.key+1). \(.value.email)  [\(.value.id)]"' \
                "${CONFIG_FILE}" 2>/dev/null
         fi
 
-        # Show the installed Xray binary version
         if [[ -x "${XRAY_BIN}" ]]; then
             local XRAY_VER
             XRAY_VER="$("${XRAY_BIN}" version 2>/dev/null | head -n1 || echo 'unknown')"
@@ -1227,16 +1031,11 @@ check_status() {
     separator
     echo ""
 
-    # ── [4] SSL certificate validity ──────────────────────────────────────────
     echo -e "  ${WHITE}${BOLD}[ 4 ]  SSL Certificate${NC}"
     echo ""
 
     if [[ -f "${CERT_FULLCHAIN}" ]]; then
         local CERT_EXPIRY CERT_CN
-        # 'openssl x509' reads and parses an X.509 certificate file.
-        # -noout     — do not print the raw certificate data
-        # -enddate   — print the "Not After" (expiry) field
-        # -subject   — print the subject (includes the CN / common name)
         CERT_EXPIRY="$(openssl x509 -noout -enddate -in "${CERT_FULLCHAIN}" 2>/dev/null \
                        | cut -d= -f2)"
         CERT_CN="$(openssl x509 -noout -subject -in "${CERT_FULLCHAIN}" 2>/dev/null \
@@ -1246,8 +1045,6 @@ check_status() {
         echo -e "  CN / SAN: ${WHITE}${CERT_CN:-unknown}${NC}"
         echo -e "  Expires : ${WHITE}${CERT_EXPIRY:-unknown}${NC}"
 
-        # 'openssl x509 -checkend N' returns 0 if the cert is valid for N more seconds
-        # 30 days = 30 × 86400 = 2592000 seconds
         if openssl x509 -noout -checkend 2592000 -in "${CERT_FULLCHAIN}" &>/dev/null; then
             echo -e "  Status  : ${GREEN}Valid — more than 30 days remaining${NC}"
         else
@@ -1262,7 +1059,6 @@ check_status() {
     separator
     echo ""
 
-    # ── [5] Recent error log ──────────────────────────────────────────────────
     echo -e "  ${WHITE}${BOLD}[ 5 ]  Recent Xray Error Log (last 15 lines)${NC}"
     echo ""
 
@@ -1287,15 +1083,6 @@ check_status() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 11  UNINSTALL  (Menu option 5)
-#       Performs a complete, ordered teardown:
-#         1. Stop + disable systemd service
-#         2. Remove service unit file
-#         3. Remove Xray binary
-#         4. Remove config directory (including metadata and geo-data)
-#         5. Remove log directory
-#         6. Remove SSL certificate directory
-#         7. Remove UFW rules
-#         8. Optionally remove acme.sh and all its issued certs
 # ─────────────────────────────────────────────────────────────────────────────
 
 uninstall_xray() {
@@ -1313,10 +1100,13 @@ uninstall_xray() {
     echo -e "   ${RED}→${NC}  UFW rules for ports 80 and 443"
     echo ""
 
-    read -rp "  Also remove acme.sh and ALL its issued certificates? [y/N]: " RM_ACME
+    # ── PATCHED ───────────────────────────────────────────────────────────────
+    echo -e "  ${YELLOW}Also remove acme.sh and ALL its issued certificates? [y/N]:${NC} "
+    read -r RM_ACME
     echo ""
     echo -e "  ${YELLOW}Type the word${NC} ${WHITE}CONFIRM${NC} ${YELLOW}and press Enter to proceed:${NC}"
-    read -rp "  > " UNINSTALL_WORD
+    echo -e "  ${YELLOW}> ${NC}"
+    read -r UNINSTALL_WORD
     echo ""
 
     if [[ "${UNINSTALL_WORD}" != "CONFIRM" ]]; then
@@ -1327,7 +1117,6 @@ uninstall_xray() {
 
     msg_step "Uninstalling..."
 
-    # ── Stop and disable the systemd service ──────────────────────────────────
     msg_info "Stopping xray.service..."
     systemctl stop  xray 2>/dev/null && msg_ok "Service stopped."  || \
         msg_warn "Service was not running (skipped)."
@@ -1336,57 +1125,45 @@ uninstall_xray() {
     systemctl disable xray 2>/dev/null && msg_ok "Service disabled." || \
         msg_warn "Service was not enabled (skipped)."
 
-    # ── Remove systemd unit file ──────────────────────────────────────────────
     if [[ -f "${SERVICE_FILE}" ]]; then
         rm -f "${SERVICE_FILE}"
         msg_ok "Removed: ${SERVICE_FILE}"
     fi
 
-    # Tell systemd to re-scan unit files so the removed service disappears
-    # from 'systemctl list-units'. reset-failed clears any lingering error state.
     systemctl daemon-reload  2>/dev/null || true
     systemctl reset-failed   2>/dev/null || true
     msg_ok "systemd daemon reloaded."
 
-    # ── Remove Xray binary ────────────────────────────────────────────────────
     if [[ -f "${XRAY_BIN}" ]]; then
         rm -f "${XRAY_BIN}"
         msg_ok "Removed: ${XRAY_BIN}"
     fi
 
-    # ── Remove configuration directory ───────────────────────────────────────
-    # This also removes geoip.dat, geosite.dat, .domain, .xhttp_path, config.json
     if [[ -d "${XRAY_CONFIG_DIR}" ]]; then
         rm -rf "${XRAY_CONFIG_DIR}"
         msg_ok "Removed: ${XRAY_CONFIG_DIR}"
     fi
 
-    # ── Remove log directory ──────────────────────────────────────────────────
     if [[ -d "${LOG_DIR}" ]]; then
         rm -rf "${LOG_DIR}"
         msg_ok "Removed: ${LOG_DIR}"
     fi
 
-    # ── Remove SSL certificate directory ─────────────────────────────────────
     if [[ -d "${CERT_DIR}" ]]; then
         rm -rf "${CERT_DIR}"
         msg_ok "Removed: ${CERT_DIR}"
     fi
 
-    # ── Remove install log ────────────────────────────────────────────────────
     rm -f "${INSTALL_LOG}"
 
-    # ── Remove UFW rules ──────────────────────────────────────────────────────
     if cmd_exists ufw; then
         ufw delete allow 80/tcp  2>/dev/null && msg_ok "Removed UFW rule: port 80."  || true
         ufw delete allow 443/tcp 2>/dev/null && msg_ok "Removed UFW rule: port 443." || true
     fi
 
-    # ── Optionally remove acme.sh ─────────────────────────────────────────────
     if [[ "${RM_ACME,,}" == "y" ]]; then
         if [[ -f "${ACME_BIN}" ]]; then
             msg_info "Uninstalling acme.sh..."
-            # acme.sh --uninstall removes itself, its config, and its cron job
             "${ACME_BIN}" --uninstall >>"${INSTALL_LOG}" 2>&1 || true
             rm -rf "${ACME_HOME}"
             msg_ok "acme.sh removed."
@@ -1394,9 +1171,6 @@ uninstall_xray() {
             msg_warn "acme.sh not found at ${ACME_HOME}. Skipping."
         fi
 
-        # Belt-and-suspenders: scrub any remaining acme.sh cron entries.
-        # 'crontab -l' lists current jobs; grep -v filters out acme lines;
-        # the result is piped back to 'crontab -' to set the new crontab.
         if crontab -l 2>/dev/null | grep -q 'acme.sh'; then
             crontab -l 2>/dev/null | grep -v 'acme.sh' | crontab -
             msg_ok "acme.sh cron entries removed."
@@ -1444,24 +1218,21 @@ show_menu() {
     echo ""
     separator
     echo ""
-    read -rp "  Enter choice [1-6]: " MENU_CHOICE
+    # ── PATCHED: echo prompt, then plain read -r — works on ALL terminals ─────
+    echo -e "  ${YELLOW}Enter choice [1-6]:${NC} "
+    read -r MENU_CHOICE
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 13  ENTRY POINT
-#       Pre-flight checks run first (always fatal on failure).
-#       Then the interactive menu loops until the user selects Exit.
 # ─────────────────────────────────────────────────────────────────────────────
 
 main() {
-    # These two checks are unconditional and will exit immediately on failure.
     check_root
     check_ubuntu_2404
 
-    # Ensure the log directory exists before any function tries to write to it
     mkdir -p "$(dirname "${INSTALL_LOG}")" 2>/dev/null || true
 
-    # Infinite menu loop — only 'Exit' (option 6) breaks out cleanly
     while true; do
         show_menu
         case "${MENU_CHOICE}" in
@@ -1484,5 +1255,4 @@ main() {
     done
 }
 
-# Kick everything off, forwarding any command-line args to main()
 main "$@"
