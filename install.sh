@@ -6,7 +6,7 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 2.1.0  (Android SSH Patched)
+# xray-xhttp-manager.sh  ·  Version 2.2.0  (Android SSH /dev/tty Fix)
 # =============================================================================
 # Description : Automates the full lifecycle of Xray-core using the XHTTP
 #               transport protocol on Ubuntu 24.04 LTS.
@@ -15,7 +15,7 @@
 #               · Protocol : VLESS (zero-overhead, CDN-friendly)
 #               · CDN      : Cloudflare and compatible providers
 #
-# Patch notes : v2.1.0 — All read -rp replaced with separate echo + read -r
+# Patch notes : v2.2.0 — All read redirected to /dev/tty for Android SSH PTY fix
 #               for full compatibility with Android SSH apps (JuiceSSH,
 #               ConnectBot, Termius, etc.) that have broken readline PTYs.
 #
@@ -106,7 +106,7 @@ is_port_in_use() {
 press_enter() {
     echo ""
     echo -e "  ${YELLOW}Press Enter to return to the main menu...${NC}"
-    read -r _DUMMY
+    read -r _DUMMY < /dev/tty
 }
 
 urlencode() {
@@ -268,7 +268,7 @@ install_xray() {
     echo ""
     # ── PATCHED: echo prompt separately, then plain read -r ──────────────────
     echo -e "  ${YELLOW}Domain name:${NC} "
-    read -r DOMAIN
+    read -r DOMAIN < /dev/tty
 
     DOMAIN="${DOMAIN#http://}"
     DOMAIN="${DOMAIN#https://}"
@@ -309,7 +309,7 @@ install_xray() {
     echo ""
     # ── PATCHED ───────────────────────────────────────────────────────────────
     echo -e "  ${YELLOW}Continue with domain '${DOMAIN}'? [Y/n]:${NC} "
-    read -r DNS_CONFIRM
+    read -r DNS_CONFIRM < /dev/tty
     [[ "${DNS_CONFIRM,,}" == "n" ]] && { msg_info "Installation cancelled."; press_enter; return; }
 
     mkdir -p "$(dirname "${INSTALL_LOG}")"
@@ -374,7 +374,7 @@ install_xray() {
     echo ""
     # ── PATCHED ───────────────────────────────────────────────────────────────
     echo -e "  ${YELLOW}Ready to issue certificate? [Y/n]:${NC} "
-    read -r CERT_CONFIRM
+    read -r CERT_CONFIRM < /dev/tty
     [[ "${CERT_CONFIRM,,}" == "n" ]] && { msg_info "Installation cancelled."; press_enter; return; }
 
     mkdir -p "${CERT_DIR}"
@@ -721,7 +721,7 @@ add_user() {
     echo ""
     # ── PATCHED ───────────────────────────────────────────────────────────────
     echo -e "  ${YELLOW}New username:${NC} "
-    read -r USERNAME
+    read -r USERNAME < /dev/tty
 
     if [[ -z "${USERNAME}" ]] || [[ "${USERNAME}" =~ [^a-zA-Z0-9_-] ]]; then
         msg_err "Invalid username '${USERNAME}'. Allowed chars: a-z A-Z 0-9 _ -"
@@ -825,7 +825,7 @@ view_client_config() {
 
     # ── PATCHED ───────────────────────────────────────────────────────────────
     echo -e "  ${YELLOW}Select user number [1-${#USERS[@]}]:${NC} "
-    read -r USER_NUM
+    read -r USER_NUM < /dev/tty
 
     if ! [[ "${USER_NUM}" =~ ^[0-9]+$ ]] || \
        [[ "${USER_NUM}" -lt 1 ]] || \
@@ -1102,11 +1102,11 @@ uninstall_xray() {
 
     # ── PATCHED ───────────────────────────────────────────────────────────────
     echo -e "  ${YELLOW}Also remove acme.sh and ALL its issued certificates? [y/N]:${NC} "
-    read -r RM_ACME
+    read -r RM_ACME < /dev/tty
     echo ""
     echo -e "  ${YELLOW}Type the word${NC} ${WHITE}CONFIRM${NC} ${YELLOW}and press Enter to proceed:${NC}"
     echo -e "  ${YELLOW}> ${NC}"
-    read -r UNINSTALL_WORD
+    read -r UNINSTALL_WORD < /dev/tty
     echo ""
 
     if [[ "${UNINSTALL_WORD}" != "CONFIRM" ]]; then
@@ -1220,7 +1220,7 @@ show_menu() {
     echo ""
     # ── PATCHED: echo prompt, then plain read -r — works on ALL terminals ─────
     echo -e "  ${YELLOW}Enter choice [1-6]:${NC} "
-    read -r MENU_CHOICE
+    read -r MENU_CHOICE < /dev/tty
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1228,6 +1228,16 @@ show_menu() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 main() {
+    # Force a sane terminal type for Android SSH apps (JuiceSSH, ConnectBot, Termius, etc.)
+    # Without this, some apps report TERM="" which breaks color codes and cursor handling.
+    export TERM="${TERM:-xterm-256color}"
+
+    # Redirect stdin to /dev/tty — the real controlling terminal device.
+    # This is the definitive fix for Android SSH apps whose PTY does not correctly
+    # wire up stdin inside subshells and functions. All 'read' calls in this script
+    # also explicitly use '< /dev/tty' as a belt-and-suspenders measure.
+    exec 0</dev/tty
+
     check_root
     check_ubuntu_2404
 
