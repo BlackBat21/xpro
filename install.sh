@@ -356,15 +356,17 @@ install_xray() {
     msg_step "Step 5/9 — Setting up acme.sh (Let's Encrypt client)"
     if [[ -f "${ACME_BIN}" ]]; then
         msg_ok "acme.sh already installed."
+        export PATH="${ACME_HOME}:${PATH}"
     else
         msg_info "Downloading acme.sh..."
-        if ! curl -fsSL "https://get.acme.sh" | bash -s -- \
-             --install-online --accountemail "admin@${DOMAIN}" \
+        if ! curl -fsSL "https://get.acme.sh" | bash -s "email=admin@${DOMAIN}" \
              >>"${INSTALL_LOG}" 2>&1; then
             msg_err "acme.sh installation failed. See ${INSTALL_LOG}." "exit"
         fi
         msg_ok "acme.sh installed to ${ACME_HOME}."
     fi
+    # Ensure acme.sh is in PATH for this session
+    export PATH="${ACME_HOME}:${PATH}"
     msg_info "Setting CA to Let's Encrypt..."
     "${ACME_BIN}" --set-default-ca --server letsencrypt >>"${INSTALL_LOG}" 2>&1 || true
     msg_ok "CA set: Let's Encrypt."
@@ -381,6 +383,9 @@ install_xray() {
     [[ "${CERT_CONFIRM,,}" == "n" ]] && { msg_info "Cancelled."; press_enter; return; }
 
     mkdir -p "${CERT_DIR}"
+    msg_info "Stopping Xray temporarily to free port 80..."
+    systemctl stop xray 2>/dev/null || true
+    sleep 1
     msg_info "Issuing certificate (~30–60 seconds)..."
     if ! "${ACME_BIN}" --issue --standalone -d "${DOMAIN}" \
          --keylength ec-256 >>"${INSTALL_LOG}" 2>&1; then
