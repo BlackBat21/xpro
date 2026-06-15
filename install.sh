@@ -8,20 +8,26 @@
 #
 # xray-xhttp-manager.sh  ·  Version 2.5.0
 # =============================================================================
-# Description : Automates the full lifecycle of Xray-core using the XHTTP
-#               transport protocol on Ubuntu 24.04 LTS.
-#               · Port 80  — NTLS inbound (CDN mode; CDN terminates TLS)
-#               · Port 443 — TLS inbound  (direct; Let's Encrypt certificate)
+# Description : Automates the full lifecycle of Xray-core using XHTTP and
+#               HTTP Upgrade transports on Ubuntu 24.04 LTS.
+#               · Port 80  — XHTTP NTLS + HTTP Upgrade NTLS  (CDN mode)
+#               · Port 443 — XHTTP TLS  + HTTP Upgrade TLS   (direct)
 #               · Protocol : VLESS (zero-overhead, CDN-friendly)
 #               · CDN      : Cloudflare and compatible providers
+#               · Design   : Outer VLESS+TCP inbounds on 80/443 route by
+#                            path to inner VLESS+XHTTP / VLESS+httpupgrade
+#                            inbounds on localhost. No header obfuscation.
 #
 # Patch notes :
 #   v2.1.0 — All read -rp replaced with echo + read -r (Android SSH fix)
 #   v2.2.0 — exec 0</dev/tty + TERM export in main() (Android PTY fix)
-#   v2.5.0 — Both XHTTP and HTTP Upgrade now share ports 80 & 443 via
-#             Xray path-based TCP fallbacks. Outer TCP inbounds on 80/443
-#             route to inner localhost inbounds (10080/10081/10443/10444)
-#             by path. Eliminates need for separate 8080/8443 ports.
+#   v2.3.0 — geoip.dat/geosite.dat: create /usr/local/share/xray/ first,
+#             download geo files there, add XRAY_LOCATION_ASSET env to
+#             systemd service. Eliminates "no such file" crash on start.
+#   v2.5.0 — HTTP Upgrade added alongside XHTTP via path-based TCP fallbacks.
+#             Outer VLESS+TCP (raw, no header obfuscation) routes to inner
+#             VLESS+XHTTP (10080/10443) or VLESS+httpupgrade (10081/10444).
+#             geoip:private block exempts loopback via inboundTag rule.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -167,7 +173,7 @@ print_banner() {
     echo "  ║                                                                  ║"
     echo "  ║       X R A Y - C O R E   ·   X H T T P   M A N A G E R        ║"
     echo "  ║                                                                  ║"
-    echo "  ║   Transport : VLESS + XHTTP  /  HTTP Upgrade          v2.5.0   ║"
+    echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade            v2.5.0   ║"
     echo "  ║   Port 80   : XHTTP + HTTP Upgrade  NTLS  (CDN mode)            ║"
     echo "  ║   Port 443  : XHTTP + HTTP Upgrade  TLS   (Direct, LE cert)     ║"
     echo "  ║   Routing   : Path-based fallbacks (shared ports)               ║"
@@ -499,9 +505,9 @@ install_xray() {
     touch "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
     chmod 640 "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
 
-    echo "${DOMAIN}"        > "${DOMAIN_FILE}"
-    echo "${XHTTP_PATH}"    > "${PATH_FILE}"
-    echo "${UPGRADE_PATH}"  > "${UPGRADE_PATH_FILE}"
+    echo "${DOMAIN}"       > "${DOMAIN_FILE}"
+    echo "${XHTTP_PATH}"   > "${PATH_FILE}"
+    echo "${UPGRADE_PATH}" > "${UPGRADE_PATH_FILE}"
 
     local INIT_UUID INIT_USER
     INIT_UUID="$(uuidgen)"
@@ -509,16 +515,26 @@ install_xray() {
     msg_ok "Initial user: ${WHITE}${INIT_USER}${NC}  UUID: ${WHITE}${INIT_UUID}${NC}"
 
     # Write config.json
-    # Architecture: 2 outer TCP inbounds (ports 80 & 443) use Xray fallbacks
-    # to route by path to 4 inner dokodemo-door inbounds listening on localhost:
     #
-    #   Port 80  (NTLS) ──┬─ path=XHTTP_PATH   → 127.0.0.1:10080 (xhttp, no TLS)
-    #                      └─ path=UPGRADE_PATH → 127.0.0.1:10081 (httpupgrade, no TLS)
+    # Architecture — two outer TCP inbounds route by path to four inner inbounds:
     #
-    #   Port 443 (TLS)  ──┬─ path=XHTTP_PATH   → 127.0.0.1:10443 (xhttp, TLS terminated)
-    #                      └─ path=UPGRADE_PATH → 127.0.0.1:10444 (httpupgrade, TLS terminated)
+    #   Port 80  (NTLS) ──┬─ path=XHTTP_PATH   → 127.0.0.1:10080  VLESS+XHTTP
+    #                      └─ path=UPGRADE_PATH → 127.0.0.1:10081  VLESS+httpupgrade
     #
-    # All 4 inner inbounds share the same user list via VLESS.
+    #   Port 443 (TLS)  ──┬─ path=XHTTP_PATH   → 127.0.0.1:10443  VLESS+XHTTP
+    #                      └─ path=UPGRADE_PATH → 127.0.0.1:10444  VLESS+httpupgrade
+    #
+    # Outer inbounds: VLESS+TCP, raw (no header obfuscation — header.type=http
+    # would break fallbacks). VLESS auth on outer fires only for direct VLESS+TCP
+    # clients; XHTTP/httpupgrade clients fail outer VLESS and fall through to inner.
+    #
+    # Inner inbounds: VLESS+XHTTP or VLESS+httpupgrade on 127.0.0.1. These do the
+    # actual transport negotiation and VLESS UUID authentication for XHTTP clients.
+    # sniffing is disabled on inner inbounds — it would misidentify XHTTP frames.
+    #
+    # Routing: geoip:private block rule is preceded by an inboundTag→direct rule
+    # for the four inner inbounds, preventing the block from intercepting the
+    # loopback-to-loopback fallback delivery (127.0.0.1 is inside geoip:private).
     cat > "${CONFIG_FILE}" << EOF
 {
   "log": {
@@ -722,15 +738,20 @@ install_xray() {
     "rules": [
       {
         "type": "field",
-        "inboundTag": ["xhttp-inner-p10080","upgrade-inner-p10081","xhttp-inner-p10443","upgrade-inner-p10444"],
+        "inboundTag": [
+          "xhttp-inner-p10080",
+          "upgrade-inner-p10081",
+          "xhttp-inner-p10443",
+          "upgrade-inner-p10444"
+        ],
         "outboundTag": "direct",
-        "remark": "Inner localhost inbounds always exit direct — must precede the private-IP block rule"
+        "remark": "Inner inbounds always exit direct — evaluated before the private-IP block rule below"
       },
       {
         "type": "field",
         "ip": ["geoip:private"],
         "outboundTag": "block",
-        "remark": "Block RFC-1918 LAN destinations (SSRF prevention) — does not apply to inner inbounds due to rule above"
+        "remark": "Block RFC-1918 LAN destinations for SSRF prevention"
       }
     ]
   },
@@ -800,14 +821,6 @@ SYSTEMD_EOF
     fi
     msg_ok "Config validation passed."
 
-    # Pre-start: confirm geo-data files are present (required for routing rules)
-    if [[ ! -s "${GEO_DIR}/geoip.dat" ]] || [[ ! -s "${GEO_DIR}/geosite.dat" ]]; then
-        msg_err "Geo-data files are MISSING in ${GEO_DIR}."
-        msg_err "Xray will fail to start because config.json references geoip:private."
-        msg_err "Re-run this option after restoring the files or check ${INSTALL_LOG}."
-        press_enter; return
-    fi
-
     if ! systemctl start xray; then
         msg_err "Xray failed to start."
         msg_err "Run: ${WHITE}journalctl -u xray -n 30 --no-pager -l${NC}"
@@ -823,9 +836,9 @@ SYSTEMD_EOF
     fi
 
     if cmd_exists ufw; then
-        ufw allow OpenSSH                                              >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 80/tcp   comment 'Xray XHTTP+Upgrade NTLS CDN'     >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 443/tcp  comment 'Xray XHTTP+Upgrade TLS direct'   >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow OpenSSH                                     >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 80/tcp  comment 'Xray XHTTP NTLS CDN'      >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 443/tcp comment 'Xray XHTTP TLS direct'    >>"${INSTALL_LOG}" 2>&1 || true
         msg_ok "UFW: ports 22, 80 and 443 opened."
     else
         msg_warn "UFW not found. Open ports 80/443 in your cloud security group manually."
@@ -838,8 +851,8 @@ SYSTEMD_EOF
     echo -e "  ${WHITE}Domain         :${NC} ${DOMAIN}"
     echo -e "  ${WHITE}XHTTP path     :${NC} ${XHTTP_PATH}"
     echo -e "  ${WHITE}Upgrade path   :${NC} ${UPGRADE_PATH}"
-    echo -e "  ${WHITE}Port 80        :${NC} XHTTP (path: ${XHTTP_PATH})  +  HTTP Upgrade (path: ${UPGRADE_PATH})  — CDN/NTLS"
-    echo -e "  ${WHITE}Port 443       :${NC} XHTTP (path: ${XHTTP_PATH})  +  HTTP Upgrade (path: ${UPGRADE_PATH})  — TLS direct"
+    echo -e "  ${WHITE}Port 80        :${NC} XHTTP (${XHTTP_PATH})  +  HTTP Upgrade (${UPGRADE_PATH})  — CDN/NTLS"
+    echo -e "  ${WHITE}Port 443       :${NC} XHTTP (${XHTTP_PATH})  +  HTTP Upgrade (${UPGRADE_PATH})  — TLS direct"
     echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
     echo -e "  ${WHITE}Geo-data       :${NC} ${GEO_DIR}/"
     echo ""
@@ -895,7 +908,7 @@ add_user() {
        "${CONFIG_FILE}" > "${TMP_CFG}"; then
         if jq empty "${TMP_CFG}" 2>/dev/null; then
             mv "${TMP_CFG}" "${CONFIG_FILE}"
-            msg_ok "User '${USERNAME}' added to all inbounds (outer TCP + inner XHTTP/HTTP Upgrade)."
+            msg_ok "User '${USERNAME}' added to all inbounds (outer + inner)."
         else
             msg_err "jq produced invalid JSON. Config unchanged."
             rm -f "${TMP_CFG}"; press_enter; return
@@ -1008,7 +1021,7 @@ view_client_config() {
     NTLS_URL+="&path=${PATH_ENC}&host=${DOMAIN}&security=none"
     NTLS_URL+="#${SELECTED_USER}-XHTTP-NTLS-TestOnly"
 
-    # [D] HTTP Upgrade CDN — port 80 NTLS via CDN on 443
+    # [D] HTTP Upgrade CDN Mode — via CDN on 443 → origin port 80
     local UPGRADE_CDN_URL
     UPGRADE_CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
     UPGRADE_CDN_URL+="?encryption=none&type=httpupgrade"
@@ -1016,7 +1029,7 @@ view_client_config() {
     UPGRADE_CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
     UPGRADE_CDN_URL+="#${SELECTED_USER}-Upgrade-CDN"
 
-    # [E] HTTP Upgrade Direct TLS — port 443
+    # [E] HTTP Upgrade Direct TLS — client connects directly to port 443
     local UPGRADE_TLS_URL
     UPGRADE_TLS_URL="vless://${USER_UUID}@${DOMAIN}:443"
     UPGRADE_TLS_URL+="?encryption=none&type=httpupgrade"
@@ -1158,18 +1171,38 @@ check_status() {
     P443_INFO="$(ss -tlnp 2>/dev/null | grep ':443 ' || echo '')"
 
     if [[ -n "${P80_INFO}" ]]; then
-        echo -e "  Port 80  (XHTTP + HTTP Upgrade NTLS) : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 80  (NTLS) : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P80_INFO}${NC}"
     else
-        echo -e "  Port 80  (XHTTP + HTTP Upgrade NTLS) : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 80  (NTLS) : ${RED}○ NOT LISTENING${NC}"
     fi
 
     if [[ -n "${P443_INFO}" ]]; then
-        echo -e "  Port 443 (XHTTP + HTTP Upgrade TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 443 (TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P443_INFO}${NC}"
     else
-        echo -e "  Port 443 (XHTTP + HTTP Upgrade TLS)  : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 443 (TLS)  : ${RED}○ NOT LISTENING${NC}"
     fi
+
+    echo ""
+    echo -e "  ${WHITE}${BOLD}Inner inbounds (127.0.0.1 only):${NC}"
+    echo ""
+    for INNER_PORT in 10080 10081 10443 10444; do
+        local INNER_LABEL
+        case "${INNER_PORT}" in
+            10080) INNER_LABEL="XHTTP  NTLS" ;;
+            10081) INNER_LABEL="Upgrade NTLS" ;;
+            10443) INNER_LABEL="XHTTP  TLS " ;;
+            10444) INNER_LABEL="Upgrade TLS " ;;
+        esac
+        local INNER_INFO
+        INNER_INFO="$(ss -tlnp 2>/dev/null | grep ":${INNER_PORT} " || echo '')"
+        if [[ -n "${INNER_INFO}" ]]; then
+            echo -e "  Port ${INNER_PORT} (${INNER_LABEL}) : ${GREEN}${BOLD}● LISTENING${NC}"
+        else
+            echo -e "  Port ${INNER_PORT} (${INNER_LABEL}) : ${RED}○ NOT LISTENING${NC}"
+        fi
+    done
 
     echo ""
     separator
@@ -1179,8 +1212,9 @@ check_status() {
     echo -e "  ${WHITE}${BOLD}[ 3 ]  Configuration Summary${NC}"
     echo ""
     if is_xray_installed; then
-        [[ -f "${DOMAIN_FILE}" ]] && echo -e "  Domain      : ${WHITE}$(cat "${DOMAIN_FILE}")${NC}"
-        [[ -f "${PATH_FILE}" ]]   && echo -e "  XHTTP path  : ${WHITE}$(cat "${PATH_FILE}")${NC}"
+        [[ -f "${DOMAIN_FILE}" ]]       && echo -e "  Domain        : ${WHITE}$(cat "${DOMAIN_FILE}")${NC}"
+        [[ -f "${PATH_FILE}" ]]         && echo -e "  XHTTP path    : ${WHITE}$(cat "${PATH_FILE}")${NC}"
+        [[ -f "${UPGRADE_PATH_FILE}" ]] && echo -e "  Upgrade path  : ${WHITE}$(cat "${UPGRADE_PATH_FILE}")${NC}"
 
         local USER_COUNT
         USER_COUNT="$(jq '.inbounds[0].settings.clients | length' \
@@ -1281,7 +1315,7 @@ uninstall_xray() {
     echo ""
     echo -e "  Items that will be deleted:"
     echo -e "   ${RED}→${NC}  Xray binary      : ${XRAY_BIN}"
-    echo -e "   ${RED}→${NC}  Configuration    : ${XRAY_CONFIG_DIR}/"
+    echo -e "   ${RED}→${NC}  Configuration    : ${XRAY_CONFIG_DIR}/  (incl. .domain, .xhttp_path, .upgrade_path)"
     echo -e "   ${RED}→${NC}  Geo-data         : ${GEO_DIR}/"
     echo -e "   ${RED}→${NC}  Log files        : ${LOG_DIR}/"
     echo -e "   ${RED}→${NC}  SSL certificates : ${CERT_DIR}/"
@@ -1321,8 +1355,8 @@ uninstall_xray() {
     msg_ok "systemd reloaded."
 
     if cmd_exists ufw; then
-        ufw delete allow 80/tcp   2>/dev/null && msg_ok "Removed UFW rule: 80."  || true
-        ufw delete allow 443/tcp  2>/dev/null && msg_ok "Removed UFW rule: 443." || true
+        ufw delete allow 80/tcp  2>/dev/null && msg_ok "Removed UFW rule: 80."  || true
+        ufw delete allow 443/tcp 2>/dev/null && msg_ok "Removed UFW rule: 443." || true
     fi
 
     if [[ "${RM_ACME,,}" == "y" ]]; then
@@ -1361,14 +1395,14 @@ show_menu() {
     print_banner
     echo -e "  ${WHITE}${BOLD}Select an option:${NC}"
     echo ""
-    echo -e "  ${CYAN}  1.${NC}  ${GREEN}Install Xray-core${NC} (XHTTP + CDN Optimised)"
-    echo -e "         ${DIM}Install Xray with VLESS+XHTTP on ports 80 and 443${NC}"
+    echo -e "  ${CYAN}  1.${NC}  ${GREEN}Install Xray-core${NC} (XHTTP + HTTP Upgrade, CDN Optimised)"
+    echo -e "         ${DIM}VLESS+XHTTP and VLESS+HTTP Upgrade on ports 80 and 443${NC}"
     echo ""
     echo -e "  ${CYAN}  2.${NC}  ${GREEN}Add User${NC}"
     echo -e "         ${DIM}Generate a UUID and add a new VLESS user${NC}"
     echo ""
     echo -e "  ${CYAN}  3.${NC}  ${GREEN}View Client Config${NC}"
-    echo -e "         ${DIM}Show VLESS URLs and QR codes for all modes${NC}"
+    echo -e "         ${DIM}Show VLESS URLs and QR codes for all 6 modes (XHTTP + Upgrade)${NC}"
     echo ""
     echo -e "  ${CYAN}  4.${NC}  ${GREEN}Check Status${NC}"
     echo -e "         ${DIM}Service state, ports, users, cert expiry, logs${NC}"
