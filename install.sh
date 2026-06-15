@@ -535,7 +535,7 @@ install_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}" }
         ],
         "decryption": "none",
         "fallbacks": [
@@ -555,8 +555,7 @@ install_xray() {
         "network": "tcp",
         "security": "none",
         "tcpSettings": {
-          "acceptProxyProtocol": false,
-          "header": { "type": "http" }
+          "acceptProxyProtocol": false
         }
       }
     },
@@ -568,7 +567,7 @@ install_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}" }
         ],
         "decryption": "none",
         "fallbacks": [
@@ -598,8 +597,7 @@ install_xray() {
           ]
         },
         "tcpSettings": {
-          "acceptProxyProtocol": false,
-          "header": { "type": "http" }
+          "acceptProxyProtocol": false
         }
       }
     },
@@ -611,7 +609,7 @@ install_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}" }
         ],
         "decryption": "none"
       },
@@ -630,7 +628,7 @@ install_xray() {
           }
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": false }
     },
 
     {
@@ -640,7 +638,7 @@ install_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}" }
         ],
         "decryption": "none"
       },
@@ -652,7 +650,7 @@ install_xray() {
           "path": "${UPGRADE_PATH}"
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": false }
     },
 
     {
@@ -662,7 +660,7 @@ install_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}" }
         ],
         "decryption": "none"
       },
@@ -681,7 +679,7 @@ install_xray() {
           }
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": false }
     },
 
     {
@@ -691,7 +689,7 @@ install_xray() {
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}" }
         ],
         "decryption": "none"
       },
@@ -703,7 +701,7 @@ install_xray() {
           "path": "${UPGRADE_PATH}"
         }
       },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      "sniffing": { "enabled": false }
     }
 
   ],
@@ -724,9 +722,15 @@ install_xray() {
     "rules": [
       {
         "type": "field",
+        "inboundTag": ["xhttp-inner-p10080","upgrade-inner-p10081","xhttp-inner-p10443","upgrade-inner-p10444"],
+        "outboundTag": "direct",
+        "remark": "Inner localhost inbounds always exit direct — must precede the private-IP block rule"
+      },
+      {
+        "type": "field",
         "ip": ["geoip:private"],
         "outboundTag": "block",
-        "remark": "Block RFC-1918 LAN destinations (SSRF prevention)"
+        "remark": "Block RFC-1918 LAN destinations (SSRF prevention) — does not apply to inner inbounds due to rule above"
       }
     ]
   },
@@ -795,6 +799,14 @@ SYSTEMD_EOF
         press_enter; return
     fi
     msg_ok "Config validation passed."
+
+    # Pre-start: confirm geo-data files are present (required for routing rules)
+    if [[ ! -s "${GEO_DIR}/geoip.dat" ]] || [[ ! -s "${GEO_DIR}/geosite.dat" ]]; then
+        msg_err "Geo-data files are MISSING in ${GEO_DIR}."
+        msg_err "Xray will fail to start because config.json references geoip:private."
+        msg_err "Re-run this option after restoring the files or check ${INSTALL_LOG}."
+        press_enter; return
+    fi
 
     if ! systemctl start xray; then
         msg_err "Xray failed to start."
@@ -879,7 +891,7 @@ add_user() {
     TMP_CFG="$(mktemp)"
 
     if jq --arg uuid "${NEW_UUID}" --arg em "${USERNAME}" \
-       '(.inbounds[] | .settings.clients) += [{"id": $uuid, "email": $em, "flow": ""}]' \
+       '(.inbounds[] | .settings.clients) += [{"id": $uuid, "email": $em}]' \
        "${CONFIG_FILE}" > "${TMP_CFG}"; then
         if jq empty "${TMP_CFG}" 2>/dev/null; then
             mv "${TMP_CFG}" "${CONFIG_FILE}"
