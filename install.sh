@@ -6,7 +6,7 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 2.5.0
+# xray-xhttp-manager.sh  ·  Version 2.6.0
 # =============================================================================
 # Description : Automates the full lifecycle of Xray-core using XHTTP and
 #               HTTP Upgrade transports on Ubuntu 24.04 LTS.
@@ -28,6 +28,12 @@
 #             Outer VLESS+TCP (raw, no header obfuscation) routes to inner
 #             VLESS+XHTTP (10080/10443) or VLESS+httpupgrade (10081/10444).
 #             geoip:private block exempts loopback via inboundTag rule.
+#   v2.6.0 — Added catch-all fallback (dest 127.0.0.1:8080) to both outer
+#             TCP inbounds. Without it, any connection whose path does not
+#             match XHTTP_PATH or UPGRADE_PATH triggers "failed to find the
+#             default path config" and is dropped — blocking all clients.
+#             nginx installed on 127.0.0.1:8080 as decoy (catch-all dest).
+#             Decoy page makes server appear as normal website to scanners.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -348,7 +354,7 @@ install_xray() {
     msg_ok "Package lists updated."
 
     local -a DEPS=("curl" "wget" "unzip" "jq" "uuid-runtime" \
-                   "socat" "dnsutils" "qrencode" "openssl")
+                   "socat" "dnsutils" "qrencode" "openssl" "nginx")
     for dep in "${DEPS[@]}"; do
         if cmd_exists "${dep}"; then
             msg_ok "${dep} — already installed."
@@ -360,6 +366,40 @@ install_xray() {
             msg_ok "${dep} installed."
         fi
     done
+
+
+    # ── Step 4b: nginx decoy on 127.0.0.1:8080 ────────────────────────────────
+    # VLESS fallbacks require a catch-all (no-path) fallback entry or Xray logs
+    # "failed to find the default path config" and drops every unmatched connection
+    # — including legitimate VLESS clients whose first bytes don't hit a path rule.
+    # nginx listens on loopback:8080 only and serves the default Ubuntu page,
+    # making the server look like a normal website to port scanners and CDN probes.
+    msg_step "Step 4b/9 — Configuring nginx decoy (127.0.0.1:8080)"
+
+    # Remove the default site that binds to *:80 (would conflict with Xray)
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+
+    cat > /etc/nginx/sites-available/xray-decoy << 'NGINX_EOF'
+server {
+    listen 127.0.0.1:8080;
+    server_name _;
+    root /var/www/html;
+    index index.html index.nginx-debian.html;
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+NGINX_EOF
+
+    ln -sf /etc/nginx/sites-available/xray-decoy             /etc/nginx/sites-enabled/xray-decoy
+
+    if nginx -t >>"${INSTALL_LOG}" 2>&1; then
+        systemctl enable nginx >>"${INSTALL_LOG}" 2>&1 || true
+        systemctl restart nginx >>"${INSTALL_LOG}" 2>&1
+        msg_ok "nginx decoy running on 127.0.0.1:8080."
+    else
+        msg_err "nginx config test failed — see ${INSTALL_LOG}." "exit"
+    fi
 
     # ── Step 5: acme.sh ────────────────────────────────────────────────────────
     msg_step "Step 5/9 — Setting up acme.sh (Let's Encrypt client)"
@@ -564,6 +604,10 @@ install_xray() {
             "path": "${UPGRADE_PATH}",
             "dest": "127.0.0.1:10081",
             "xver": 0
+          },
+          {
+            "dest": "127.0.0.1:8080",
+            "xver": 0
           }
         ]
       },
@@ -595,6 +639,10 @@ install_xray() {
           {
             "path": "${UPGRADE_PATH}",
             "dest": "127.0.0.1:10444",
+            "xver": 0
+          },
+          {
+            "dest": "127.0.0.1:8080",
             "xver": 0
           }
         ]
@@ -839,7 +887,8 @@ SYSTEMD_EOF
         ufw allow OpenSSH                                     >>"${INSTALL_LOG}" 2>&1 || true
         ufw allow 80/tcp  comment 'Xray XHTTP NTLS CDN'      >>"${INSTALL_LOG}" 2>&1 || true
         ufw allow 443/tcp comment 'Xray XHTTP TLS direct'    >>"${INSTALL_LOG}" 2>&1 || true
-        msg_ok "UFW: ports 22, 80 and 443 opened."
+        # nginx only binds to 127.0.0.1:8080 — no UFW rule needed for it.
+        msg_ok "UFW: ports 22, 80 and 443 opened. nginx decoy on loopback only."
     else
         msg_warn "UFW not found. Open ports 80/443 in your cloud security group manually."
     fi
@@ -855,6 +904,7 @@ SYSTEMD_EOF
     echo -e "  ${WHITE}Port 443       :${NC} XHTTP (${XHTTP_PATH})  +  HTTP Upgrade (${UPGRADE_PATH})  — TLS direct"
     echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
     echo -e "  ${WHITE}Geo-data       :${NC} ${GEO_DIR}/"
+    echo -e "  ${WHITE}Decoy server   :${NC} nginx on 127.0.0.1:8080 (catch-all fallback)"
     echo ""
     echo -e "  ${YELLOW}Next steps:${NC}"
     echo -e "   • Option 3 — view client connection strings and QR codes."
@@ -1185,6 +1235,15 @@ check_status() {
     fi
 
     echo ""
+    local NGINX_INFO
+    NGINX_INFO="$(ss -tlnp 2>/dev/null | grep ':8080 ' || echo '')"
+    if [[ -n "${NGINX_INFO}" ]]; then
+        echo -e "  Port 8080 (nginx decoy) : ${GREEN}${BOLD}● LISTENING${NC}"
+    else
+        echo -e "  Port 8080 (nginx decoy) : ${RED}○ NOT LISTENING${NC} ${YELLOW}(catch-all fallback will fail)${NC}"
+    fi
+
+    echo ""
     echo -e "  ${WHITE}${BOLD}Inner inbounds (127.0.0.1 only):${NC}"
     echo ""
     for INNER_PORT in 10080 10081 10443 10444; do
@@ -1337,10 +1396,12 @@ uninstall_xray() {
 
     msg_step "Uninstalling..."
 
-    systemctl stop    xray 2>/dev/null && msg_ok "Service stopped."   || \
-        msg_warn "Service was not running."
-    systemctl disable xray 2>/dev/null && msg_ok "Service disabled."  || \
-        msg_warn "Service was not enabled."
+    systemctl stop    xray  2>/dev/null && msg_ok "Service stopped."          || msg_warn "xray was not running."
+    systemctl disable xray  2>/dev/null && msg_ok "xray service disabled."    || msg_warn "xray was not enabled."
+    systemctl stop    nginx 2>/dev/null && msg_ok "nginx decoy stopped."      || msg_warn "nginx was not running."
+    systemctl disable nginx 2>/dev/null && msg_ok "nginx decoy disabled."     || msg_warn "nginx was not enabled."
+    rm -f /etc/nginx/sites-enabled/xray-decoy \
+          /etc/nginx/sites-available/xray-decoy 2>/dev/null && msg_ok "nginx decoy config removed." || true
 
     [[ -f "${SERVICE_FILE}" ]]    && rm -f  "${SERVICE_FILE}"    && msg_ok "Removed: ${SERVICE_FILE}"
     [[ -f "${XRAY_BIN}" ]]        && rm -f  "${XRAY_BIN}"        && msg_ok "Removed: ${XRAY_BIN}"
