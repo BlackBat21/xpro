@@ -6,7 +6,7 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 2.3.0
+# xray-xhttp-manager.sh  ·  Version 2.5.0
 # =============================================================================
 # Description : Automates the full lifecycle of Xray-core using the XHTTP
 #               transport protocol on Ubuntu 24.04 LTS.
@@ -18,9 +18,10 @@
 # Patch notes :
 #   v2.1.0 — All read -rp replaced with echo + read -r (Android SSH fix)
 #   v2.2.0 — exec 0</dev/tty + TERM export in main() (Android PTY fix)
-#   v2.3.0 — geoip.dat/geosite.dat: create /usr/local/share/xray/ first,
-#             download geo files there, add XRAY_LOCATION_ASSET env to
-#             systemd service. Eliminates "no such file" crash on start.
+#   v2.5.0 — Both XHTTP and HTTP Upgrade now share ports 80 & 443 via
+#             Xray path-based TCP fallbacks. Outer TCP inbounds on 80/443
+#             route to inner localhost inbounds (10080/10081/10443/10444)
+#             by path. Eliminates need for separate 8080/8443 ports.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -56,6 +57,7 @@ GEO_DIR="/usr/local/share/xray"
 
 DOMAIN_FILE="${XRAY_CONFIG_DIR}/.domain"
 PATH_FILE="${XRAY_CONFIG_DIR}/.xhttp_path"
+UPGRADE_PATH_FILE="${XRAY_CONFIG_DIR}/.upgrade_path"
 
 CERT_DIR="/etc/ssl/xray"
 CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
@@ -165,9 +167,10 @@ print_banner() {
     echo "  ║                                                                  ║"
     echo "  ║       X R A Y - C O R E   ·   X H T T P   M A N A G E R        ║"
     echo "  ║                                                                  ║"
-    echo "  ║   Transport : VLESS + XHTTP                          v2.3.0     ║"
-    echo "  ║   Port 80   : NTLS inbound  (CDN mode — CDN terminates TLS)     ║"
-    echo "  ║   Port 443  : TLS  inbound  (Direct — Let's Encrypt cert)       ║"
+    echo "  ║   Transport : VLESS + XHTTP  /  HTTP Upgrade          v2.5.0   ║"
+    echo "  ║   Port 80   : XHTTP + HTTP Upgrade  NTLS  (CDN mode)            ║"
+    echo "  ║   Port 443  : XHTTP + HTTP Upgrade  TLS   (Direct, LE cert)     ║"
+    echo "  ║   Routing   : Path-based fallbacks (shared ports)               ║"
     echo "  ║   CDN       : Cloudflare / CloudFront / Fastly compatible       ║"
     echo "  ║   OS        : Ubuntu 24.04 LTS                                  ║"
     echo "  ║                                                                  ║"
@@ -486,16 +489,19 @@ install_xray() {
     # ── Step 8: Config files ───────────────────────────────────────────────────
     msg_step "Step 8/9 — Creating configuration files"
 
-    local XHTTP_PATH
+    local XHTTP_PATH UPGRADE_PATH
     XHTTP_PATH="/$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
-    msg_ok "Generated XHTTP path: ${WHITE}${XHTTP_PATH}${NC}"
+    UPGRADE_PATH="/$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
+    msg_ok "Generated XHTTP path   : ${WHITE}${XHTTP_PATH}${NC}"
+    msg_ok "Generated Upgrade path : ${WHITE}${UPGRADE_PATH}${NC}"
 
     mkdir -p "${XRAY_CONFIG_DIR}" "${LOG_DIR}" "${CERT_DIR}"
     touch "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
     chmod 640 "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
 
-    echo "${DOMAIN}"     > "${DOMAIN_FILE}"
-    echo "${XHTTP_PATH}" > "${PATH_FILE}"
+    echo "${DOMAIN}"        > "${DOMAIN_FILE}"
+    echo "${XHTTP_PATH}"    > "${PATH_FILE}"
+    echo "${UPGRADE_PATH}"  > "${UPGRADE_PATH_FILE}"
 
     local INIT_UUID INIT_USER
     INIT_UUID="$(uuidgen)"
@@ -503,11 +509,16 @@ install_xray() {
     msg_ok "Initial user: ${WHITE}${INIT_USER}${NC}  UUID: ${WHITE}${INIT_UUID}${NC}"
 
     # Write config.json
-    # Two inbounds:
-    #   xhttp-ntls-p80  — port 80, no TLS (CDN terminates TLS upstream)
-    #   xhttp-tls-p443  — port 443, TLS with Let's Encrypt cert (direct)
-    # Routing: block private/LAN IPs to prevent SSRF (uses geoip:private
-    # from the geo files we just downloaded)
+    # Architecture: 2 outer TCP inbounds (ports 80 & 443) use Xray fallbacks
+    # to route by path to 4 inner dokodemo-door inbounds listening on localhost:
+    #
+    #   Port 80  (NTLS) ──┬─ path=XHTTP_PATH   → 127.0.0.1:10080 (xhttp, no TLS)
+    #                      └─ path=UPGRADE_PATH → 127.0.0.1:10081 (httpupgrade, no TLS)
+    #
+    #   Port 443 (TLS)  ──┬─ path=XHTTP_PATH   → 127.0.0.1:10443 (xhttp, TLS terminated)
+    #                      └─ path=UPGRADE_PATH → 127.0.0.1:10444 (httpupgrade, TLS terminated)
+    #
+    # All 4 inner inbounds share the same user list via VLESS.
     cat > "${CONFIG_FILE}" << EOF
 {
   "log": {
@@ -516,18 +527,91 @@ install_xray() {
     "error":  "${LOG_DIR}/error.log"
   },
   "inbounds": [
+
     {
-      "tag": "xhttp-ntls-p80",
+      "tag": "tcp-ntls-p80",
       "port": ${PORT_NTLS},
       "listen": "0.0.0.0",
       "protocol": "vless",
       "settings": {
         "clients": [
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+        ],
+        "decryption": "none",
+        "fallbacks": [
           {
-            "id": "${INIT_UUID}",
-            "email": "${INIT_USER}",
-            "flow": ""
+            "path": "${XHTTP_PATH}",
+            "dest": "127.0.0.1:10080",
+            "xver": 0
+          },
+          {
+            "path": "${UPGRADE_PATH}",
+            "dest": "127.0.0.1:10081",
+            "xver": 0
           }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "none",
+        "tcpSettings": {
+          "acceptProxyProtocol": false,
+          "header": { "type": "http" }
+        }
+      }
+    },
+
+    {
+      "tag": "tcp-tls-p443",
+      "port": ${PORT_TLS},
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+        ],
+        "decryption": "none",
+        "fallbacks": [
+          {
+            "path": "${XHTTP_PATH}",
+            "dest": "127.0.0.1:10443",
+            "xver": 0
+          },
+          {
+            "path": "${UPGRADE_PATH}",
+            "dest": "127.0.0.1:10444",
+            "xver": 0
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "minVersion": "1.2",
+          "alpn": ["h2", "http/1.1"],
+          "certificates": [
+            {
+              "certificateFile": "${CERT_FULLCHAIN}",
+              "keyFile": "${CERT_KEY}"
+            }
+          ]
+        },
+        "tcpSettings": {
+          "acceptProxyProtocol": false,
+          "header": { "type": "http" }
+        }
+      }
+    },
+
+    {
+      "tag": "xhttp-inner-p10080",
+      "port": 10080,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
         ],
         "decryption": "none"
       },
@@ -546,39 +630,45 @@ install_xray() {
           }
         }
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     },
+
     {
-      "tag": "xhttp-tls-p443",
-      "port": ${PORT_TLS},
-      "listen": "0.0.0.0",
+      "tag": "upgrade-inner-p10081",
+      "port": 10081,
+      "listen": "127.0.0.1",
       "protocol": "vless",
       "settings": {
         "clients": [
-          {
-            "id": "${INIT_UUID}",
-            "email": "${INIT_USER}",
-            "flow": ""
-          }
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "httpupgrade",
+        "security": "none",
+        "httpupgradeSettings": {
+          "host": "${DOMAIN}",
+          "path": "${UPGRADE_PATH}"
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    },
+
+    {
+      "tag": "xhttp-inner-p10443",
+      "port": 10443,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
         ],
         "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
-        "security": "tls",
-        "tlsSettings": {
-          "minVersion": "1.2",
-          "alpn": ["h2", "http/1.1"],
-          "certificates": [
-            {
-              "certificateFile": "${CERT_FULLCHAIN}",
-              "keyFile": "${CERT_KEY}"
-            }
-          ]
-        },
+        "security": "none",
         "xhttpSettings": {
           "host": "${DOMAIN}",
           "path": "${XHTTP_PATH}",
@@ -591,11 +681,31 @@ install_xray() {
           }
         }
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+    },
+
+    {
+      "tag": "upgrade-inner-p10444",
+      "port": 10444,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "${INIT_UUID}", "email": "${INIT_USER}", "flow": "" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "httpupgrade",
+        "security": "none",
+        "httpupgradeSettings": {
+          "host": "${DOMAIN}",
+          "path": "${UPGRADE_PATH}"
+        }
+      },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
     }
+
   ],
   "outbounds": [
     {
@@ -701,9 +811,9 @@ SYSTEMD_EOF
     fi
 
     if cmd_exists ufw; then
-        ufw allow OpenSSH                                     >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 80/tcp  comment 'Xray XHTTP NTLS CDN'      >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 443/tcp comment 'Xray XHTTP TLS direct'    >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow OpenSSH                                              >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 80/tcp   comment 'Xray XHTTP+Upgrade NTLS CDN'     >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 443/tcp  comment 'Xray XHTTP+Upgrade TLS direct'   >>"${INSTALL_LOG}" 2>&1 || true
         msg_ok "UFW: ports 22, 80 and 443 opened."
     else
         msg_warn "UFW not found. Open ports 80/443 in your cloud security group manually."
@@ -713,12 +823,13 @@ SYSTEMD_EOF
     echo ""
     echo -e "${GREEN}${BOLD}  ✔  Installation complete!${NC}"
     echo ""
-    echo -e "  ${WHITE}Domain       :${NC} ${DOMAIN}"
-    echo -e "  ${WHITE}XHTTP path   :${NC} ${XHTTP_PATH}"
-    echo -e "  ${WHITE}Port 80      :${NC} NTLS — CDN mode (Cloudflare orange cloud)"
-    echo -e "  ${WHITE}Port 443     :${NC} TLS  — Direct mode (Let's Encrypt cert)"
-    echo -e "  ${WHITE}Initial user :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
-    echo -e "  ${WHITE}Geo-data     :${NC} ${GEO_DIR}/"
+    echo -e "  ${WHITE}Domain         :${NC} ${DOMAIN}"
+    echo -e "  ${WHITE}XHTTP path     :${NC} ${XHTTP_PATH}"
+    echo -e "  ${WHITE}Upgrade path   :${NC} ${UPGRADE_PATH}"
+    echo -e "  ${WHITE}Port 80        :${NC} XHTTP (path: ${XHTTP_PATH})  +  HTTP Upgrade (path: ${UPGRADE_PATH})  — CDN/NTLS"
+    echo -e "  ${WHITE}Port 443       :${NC} XHTTP (path: ${XHTTP_PATH})  +  HTTP Upgrade (path: ${UPGRADE_PATH})  — TLS direct"
+    echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
+    echo -e "  ${WHITE}Geo-data       :${NC} ${GEO_DIR}/"
     echo ""
     echo -e "  ${YELLOW}Next steps:${NC}"
     echo -e "   • Option 3 — view client connection strings and QR codes."
@@ -772,7 +883,7 @@ add_user() {
        "${CONFIG_FILE}" > "${TMP_CFG}"; then
         if jq empty "${TMP_CFG}" 2>/dev/null; then
             mv "${TMP_CFG}" "${CONFIG_FILE}"
-            msg_ok "User '${USERNAME}' added to both inbounds."
+            msg_ok "User '${USERNAME}' added to all inbounds (outer TCP + inner XHTTP/HTTP Upgrade)."
         else
             msg_err "jq produced invalid JSON. Config unchanged."
             rm -f "${TMP_CFG}"; press_enter; return
@@ -816,9 +927,10 @@ view_client_config() {
         press_enter; return
     fi
 
-    local DOMAIN XHTTP_PATH
+    local DOMAIN XHTTP_PATH UPGRADE_PATH
     DOMAIN="$(cat "${DOMAIN_FILE}")"
     XHTTP_PATH="$(cat "${PATH_FILE}")"
+    UPGRADE_PATH="$(cat "${UPGRADE_PATH_FILE}" 2>/dev/null || echo '/upgrade')"
 
     local -a USERS
     mapfile -t USERS < <(jq -r '.inbounds[0].settings.clients[].email' \
@@ -857,45 +969,70 @@ view_client_config() {
         press_enter; return
     fi
 
-    local PATH_ENC
+    local PATH_ENC UPGRADE_ENC
     PATH_ENC="$(urlencode "${XHTTP_PATH}")"
+    UPGRADE_ENC="$(urlencode "${UPGRADE_PATH}")"
 
-    # [A] CDN Mode — client connects to CDN:443, CDN proxies to our port 80
+    # [A] XHTTP CDN Mode — client connects to CDN:443, CDN proxies to our port 80
     local CDN_URL
     CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
     CDN_URL+="?encryption=none&type=xhttp"
     CDN_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
     CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
-    CDN_URL+="#${SELECTED_USER}-CDN"
+    CDN_URL+="#${SELECTED_USER}-XHTTP-CDN"
 
-    # [B] Direct TLS — client connects directly to our port 443
+    # [B] XHTTP Direct TLS — client connects directly to our port 443
     local DIRECT_URL
     DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
     DIRECT_URL+="?encryption=none&type=xhttp"
     DIRECT_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
     DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
-    DIRECT_URL+="#${SELECTED_USER}-Direct-TLS"
+    DIRECT_URL+="#${SELECTED_USER}-XHTTP-Direct-TLS"
 
-    # [C] NTLS — port 80, unencrypted — testing only
+    # [C] XHTTP NTLS — port 80, unencrypted — testing only
     local NTLS_URL
     NTLS_URL="vless://${USER_UUID}@${DOMAIN}:80"
     NTLS_URL+="?encryption=none&type=xhttp"
     NTLS_URL+="&path=${PATH_ENC}&host=${DOMAIN}&security=none"
-    NTLS_URL+="#${SELECTED_USER}-NTLS-TestOnly"
+    NTLS_URL+="#${SELECTED_USER}-XHTTP-NTLS-TestOnly"
+
+    # [D] HTTP Upgrade CDN — port 80 NTLS via CDN on 443
+    local UPGRADE_CDN_URL
+    UPGRADE_CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
+    UPGRADE_CDN_URL+="?encryption=none&type=httpupgrade"
+    UPGRADE_CDN_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}"
+    UPGRADE_CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
+    UPGRADE_CDN_URL+="#${SELECTED_USER}-Upgrade-CDN"
+
+    # [E] HTTP Upgrade Direct TLS — port 443
+    local UPGRADE_TLS_URL
+    UPGRADE_TLS_URL="vless://${USER_UUID}@${DOMAIN}:443"
+    UPGRADE_TLS_URL+="?encryption=none&type=httpupgrade"
+    UPGRADE_TLS_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}"
+    UPGRADE_TLS_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
+    UPGRADE_TLS_URL+="#${SELECTED_USER}-Upgrade-Direct-TLS"
+
+    # [F] HTTP Upgrade NTLS — port 80, unencrypted — testing only
+    local UPGRADE_NTLS_URL
+    UPGRADE_NTLS_URL="vless://${USER_UUID}@${DOMAIN}:80"
+    UPGRADE_NTLS_URL+="?encryption=none&type=httpupgrade"
+    UPGRADE_NTLS_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}&security=none"
+    UPGRADE_NTLS_URL+="#${SELECTED_USER}-Upgrade-NTLS-TestOnly"
 
     clear
     echo ""
     separator
     echo -e "  ${WHITE}${BOLD}Client config for: ${CYAN}${SELECTED_USER}${NC}"
     separator
-    echo -e "  ${WHITE}Domain    :${NC} ${DOMAIN}"
-    echo -e "  ${WHITE}UUID      :${NC} ${USER_UUID}"
-    echo -e "  ${WHITE}XHTTP Path:${NC} ${XHTTP_PATH}"
+    echo -e "  ${WHITE}Domain        :${NC} ${DOMAIN}"
+    echo -e "  ${WHITE}UUID          :${NC} ${USER_UUID}"
+    echo -e "  ${WHITE}XHTTP Path    :${NC} ${XHTTP_PATH}"
+    echo -e "  ${WHITE}Upgrade Path  :${NC} ${UPGRADE_PATH}"
     echo ""
 
-    # ── [A] CDN ───────────────────────────────────────────────────────────────
+    # ── [A] XHTTP CDN ─────────────────────────────────────────────────────────
     separator
-    echo -e "  ${GREEN}${BOLD}[A]  CDN MODE — Client:443 → CDN → Origin:80${NC}"
+    echo -e "  ${GREEN}${BOLD}[A]  XHTTP CDN MODE — Client:443 → CDN → Origin:80${NC}"
     echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
@@ -908,9 +1045,9 @@ view_client_config() {
         echo ""
     fi
 
-    # ── [B] Direct TLS ────────────────────────────────────────────────────────
+    # ── [B] XHTTP Direct TLS ──────────────────────────────────────────────────
     separator
-    echo -e "  ${GREEN}${BOLD}[B]  DIRECT TLS — Client:443 → Origin:443 (no CDN)${NC}"
+    echo -e "  ${GREEN}${BOLD}[B]  XHTTP DIRECT TLS — Client:443 → Origin:443 (no CDN)${NC}"
     echo -e "  ${YELLOW}Use when:${NC} DNS is grey-cloud / DNS-only (no CDN proxy)."
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
@@ -923,13 +1060,52 @@ view_client_config() {
         echo ""
     fi
 
-    # ── [C] NTLS ──────────────────────────────────────────────────────────────
+    # ── [C] XHTTP NTLS ────────────────────────────────────────────────────────
     separator
-    echo -e "  ${MAGENTA}${BOLD}[C]  NTLS PORT 80 — Unencrypted — TESTING ONLY${NC}"
+    echo -e "  ${MAGENTA}${BOLD}[C]  XHTTP NTLS PORT 80 — Unencrypted — TESTING ONLY${NC}"
     echo -e "  ${RED}  ⚠  Do NOT use in production. Traffic is plain-text.${NC}"
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
     echo -e "  ${CYAN}${NTLS_URL}${NC}"
+    echo ""
+
+    # ── [D] HTTP Upgrade CDN ──────────────────────────────────────────────────
+    separator
+    echo -e "  ${GREEN}${BOLD}[D]  HTTP UPGRADE CDN MODE — Client:443 → CDN → Origin:80${NC}"
+    echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
+    echo ""
+    echo -e "  ${WHITE}VLESS URL:${NC}"
+    echo -e "  ${CYAN}${UPGRADE_CDN_URL}${NC}"
+    echo ""
+    if cmd_exists qrencode; then
+        echo -e "  ${WHITE}QR Code:${NC}"
+        echo ""
+        qrencode -t ANSIUTF8 -m 2 "${UPGRADE_CDN_URL}"
+        echo ""
+    fi
+
+    # ── [E] HTTP Upgrade Direct TLS ───────────────────────────────────────────
+    separator
+    echo -e "  ${GREEN}${BOLD}[E]  HTTP UPGRADE DIRECT TLS — Client:443 → Origin:443 (no CDN)${NC}"
+    echo -e "  ${YELLOW}Use when:${NC} DNS is grey-cloud / DNS-only (no CDN proxy)."
+    echo ""
+    echo -e "  ${WHITE}VLESS URL:${NC}"
+    echo -e "  ${CYAN}${UPGRADE_TLS_URL}${NC}"
+    echo ""
+    if cmd_exists qrencode; then
+        echo -e "  ${WHITE}QR Code:${NC}"
+        echo ""
+        qrencode -t ANSIUTF8 -m 2 "${UPGRADE_TLS_URL}"
+        echo ""
+    fi
+
+    # ── [F] HTTP Upgrade NTLS ─────────────────────────────────────────────────
+    separator
+    echo -e "  ${MAGENTA}${BOLD}[F]  HTTP UPGRADE NTLS PORT 80 — Unencrypted — TESTING ONLY${NC}"
+    echo -e "  ${RED}  ⚠  Do NOT use in production. Traffic is plain-text.${NC}"
+    echo ""
+    echo -e "  ${WHITE}VLESS URL:${NC}"
+    echo -e "  ${CYAN}${UPGRADE_NTLS_URL}${NC}"
     echo ""
     separator
 
@@ -970,17 +1146,17 @@ check_status() {
     P443_INFO="$(ss -tlnp 2>/dev/null | grep ':443 ' || echo '')"
 
     if [[ -n "${P80_INFO}" ]]; then
-        echo -e "  Port 80  (NTLS) : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 80  (XHTTP + HTTP Upgrade NTLS) : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P80_INFO}${NC}"
     else
-        echo -e "  Port 80  (NTLS) : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 80  (XHTTP + HTTP Upgrade NTLS) : ${RED}○ NOT LISTENING${NC}"
     fi
 
     if [[ -n "${P443_INFO}" ]]; then
-        echo -e "  Port 443 (TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 443 (XHTTP + HTTP Upgrade TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P443_INFO}${NC}"
     else
-        echo -e "  Port 443 (TLS)  : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 443 (XHTTP + HTTP Upgrade TLS)  : ${RED}○ NOT LISTENING${NC}"
     fi
 
     echo ""
@@ -1133,8 +1309,8 @@ uninstall_xray() {
     msg_ok "systemd reloaded."
 
     if cmd_exists ufw; then
-        ufw delete allow 80/tcp  2>/dev/null && msg_ok "Removed UFW rule: 80."  || true
-        ufw delete allow 443/tcp 2>/dev/null && msg_ok "Removed UFW rule: 443." || true
+        ufw delete allow 80/tcp   2>/dev/null && msg_ok "Removed UFW rule: 80."  || true
+        ufw delete allow 443/tcp  2>/dev/null && msg_ok "Removed UFW rule: 443." || true
     fi
 
     if [[ "${RM_ACME,,}" == "y" ]]; then
