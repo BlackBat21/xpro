@@ -6,7 +6,7 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 2.6.0
+# xray-xhttp-manager.sh  ·  Version 2.7.0
 # =============================================================================
 # Description : Automates the full lifecycle of Xray-core using XHTTP and
 #               HTTP Upgrade transports on Ubuntu 24.04 LTS.
@@ -34,6 +34,13 @@
 #             default path config" and is dropped — blocking all clients.
 #             nginx installed on 127.0.0.1:8080 as decoy (catch-all dest).
 #             Decoy page makes server appear as normal website to scanners.
+#   v2.7.0 — Removed "h2" from tcp-tls-p443 ALPN (now http/1.1 only). VLESS
+#             fallback path-matching can only read plaintext HTTP/1.1 request
+#             lines; it cannot parse HTTP/2 binary frames. Any client that
+#             negotiated h2 via ALPN got silently killed right after the TLS
+#             handshake (TLS close_notify, zero data) because the fallback
+#             could never find a matching path. This caused "connects then
+#             immediately disconnects" for XHTTP CDN/TLS clients.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -652,7 +659,7 @@ NGINX_EOF
         "security": "tls",
         "tlsSettings": {
           "minVersion": "1.2",
-          "alpn": ["h2", "http/1.1"],
+          "alpn": ["http/1.1"],
           "certificates": [
             {
               "certificateFile": "${CERT_FULLCHAIN}",
@@ -820,6 +827,26 @@ NGINX_EOF
 }
 EOF
     msg_ok "config.json written to ${CONFIG_FILE}."
+
+    # ── Step 8b: Verify path consistency ──────────────────────────────────────
+    # Guard against any future heredoc expansion issue: confirm that every
+    # inbound which references XHTTP_PATH or UPGRADE_PATH in the written JSON
+    # actually contains the same value as the .xhttp_path / .upgrade_path files.
+    local WRITTEN_XHTTP WRITTEN_UPGRADE
+    WRITTEN_XHTTP="$(jq -r '
+      .inbounds[] | select(.tag=="xhttp-inner-p10080")
+      | .streamSettings.xhttpSettings.path' "${CONFIG_FILE}" 2>/dev/null)"
+    WRITTEN_UPGRADE="$(jq -r '
+      .inbounds[] | select(.tag=="upgrade-inner-p10081")
+      | .streamSettings.httpupgradeSettings.path' "${CONFIG_FILE}" 2>/dev/null)"
+
+    if [[ "${WRITTEN_XHTTP}" != "${XHTTP_PATH}" ]]; then
+        msg_err "Path mismatch in config.json — XHTTP inner path is '${WRITTEN_XHTTP}', expected '${XHTTP_PATH}'." "exit"
+    fi
+    if [[ "${WRITTEN_UPGRADE}" != "${UPGRADE_PATH}" ]]; then
+        msg_err "Path mismatch in config.json — Upgrade inner path is '${WRITTEN_UPGRADE}', expected '${UPGRADE_PATH}'." "exit"
+    fi
+    msg_ok "Path consistency check passed (XHTTP: ${XHTTP_PATH}  Upgrade: ${UPGRADE_PATH})."
 
     # ── Step 9: systemd service + firewall ─────────────────────────────────────
     msg_step "Step 9/9 — Creating systemd service and configuring firewall"
