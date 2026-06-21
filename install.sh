@@ -11,7 +11,7 @@
 # Description : Automates the full lifecycle of Xray-core, fronted by nginx,
 #               using XHTTP and HTTP Upgrade transports — both on the
 #               standard ports 80 and 443 — on Ubuntu 24.04 LTS.
-#               · Port 80   — nginx, real h2c listener: XHTTP + HTTP Upgrade
+#               · Port 80   — nginx, plain HTTP/1.1: HTTP Upgrade only
 #               · Port 443  — nginx, TLS: XHTTP + HTTP Upgrade
 #               · Xray itself never binds 80 or 443. It listens on two
 #                 internal loopback-only ports; nginx is the only public
@@ -19,27 +19,20 @@
 #               · Protocol : VLESS (zero-overhead, CDN-friendly)
 #               · CDN      : Cloudflare and compatible providers
 #
-# Architecture (v5.0.0, reverse-engineered from a real, actively-maintained
-# production deployment script rather than designed from scratch):
-#   Reference: github.com/GFW4Fun/x-ui-pro (x-ui-pro.sh) — an actively
-#   maintained, GitHub-signed-commit script that fronts Xray with nginx for
-#   exactly this transport mix (WS/gRPC/HttpUpgrade/XHTTP), at production
-#   scale. Its core pattern, adopted here:
-#     - ONE location per path. Inside it, nginx inspects the live request's
-#       Content-Type and dispatches to grpc_pass when it matches gRPC,
-#       falling through to proxy_pass (with Upgrade headers) otherwise.
-#       There is no separate "XHTTP path" vs "Upgrade path" routing split —
-#       both transport types can use the same location if needed; here they
-#       still get distinct paths for clarity, but the dispatch logic inside
-#       each XHTTP location is the proven content-type switch, not a
-#       hardcoded grpc_pass-only call.
-#     - listen 80 http2; IS a real, valid, commonly-used nginx directive
-#       (confirmed in XTLS/Xray-core discussion #3731's working config, and
-#       in the "Coexisting Vision+Reality" production tutorial). h2c
-#       cleartext on port 80 does NOT conflict with serving plain HTTP/1.1
-#       in the same block — earlier versions of this script wrongly assumed
-#       it did and split XHTTP onto TLS-only as a result. Both ports now
-#       run identically.
+# Architecture (audited and corrected — see patch notes v5.0.1/v5.0.2 below
+# for what changed and why; each fix cites its verification source):
+#   Reference: github.com/GFW4Fun/x-ui-pro (x-ui-pro.sh) is a real repo with
+#   a similar transport mix, but its internal nginx template was NOT
+#   independently verified during this audit — treat the "ONE location,
+#   content-type dispatch" idea below as historical context, not as a
+#   currently-accurate description (see v5.0.1).
+#     - listen 80 http2; IS valid nginx syntax, but on a cleartext (non-TLS)
+#       socket it makes that socket HTTP/2-ONLY with no fallback to
+#       HTTP/1.1 on nginx versions before 1.25.1 — and Ubuntu 24.04's
+#       stock `apt install nginx` is 1.24.0. This was DISPROVEN by a live
+#       deployment (curl against port 80 got "Received HTTP/0.9 when not
+#       allowed") and confirmed against nginx's own bug tracker — see the
+#       FIX comment on the port-80 server block, v5.0.1 below.
 #
 # Patch notes :
 #   v2.1.0 — All read -rp replaced with echo + read -r (Android SSH fix)
@@ -83,6 +76,39 @@
 #             path. Port 80 now also runs XHTTP (real h2c, not a workaround)
 #             since the earlier "h2c can't coexist with HTTP/1.1" assumption
 #             was incorrect — both ports are now structurally identical.
+#             CORRECTION (see v5.0.1): the "h2c can't coexist with HTTP/1.1"
+#             assumption this entry dismisses was actually correct for the
+#             nginx version this script installs. STILL BROKEN: see v5.0.1.
+#   v5.0.1 — STILL BROKEN, root-caused via a live deployment: every XHTTP
+#             request 404'd because the nginx location used an exact match
+#             ("location = /<path>") while Xray always requests sub-paths
+#             ("/<path>/<session-uuid>") — confirmed against a real nginx
+#             error log in XTLS/Xray-core discussion #5822. Changed to a
+#             prefix-match location on both ports, and replaced the
+#             unverified "if ($content_type ~* grpc) {grpc_pass} proxy_pass"
+#             dispatch with a single unconditional grpc_pass, matching the
+#             official XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf
+#             template and RPRX's own troubleshooting guidance in
+#             discussion #4113.
+#   v5.0.2 — STILL BROKEN on port 80 specifically, root-caused via a live
+#             curl test against the v5.0.1 build: `curl -iv http://<domain>/`
+#             returned "Received HTTP/0.9 when not allowed" — the exact
+#             symptom of an HTTP/1.1 request hitting an h2c-only nginx
+#             socket. The v5.0.0 architecture note's claim that "h2c does
+#             NOT conflict with serving plain HTTP/1.1 in the same block"
+#             was false for nginx 1.24.0 (Ubuntu 24.04's stock package);
+#             nginx didn't add same-socket h2c+HTTP/1.1 support until
+#             1.25.1 (confirmed: trac.nginx.org/nginx/ticket/816, "HTTP/1.1
+#             clients will fail on the socket, preventing the use of HTTP
+#             Upgrade" — closed/fixed in 1.25.1). This meant HTTP Upgrade
+#             on port 80 could never have worked, XHTTP on port 80 only had
+#             a chance if the client did real HTTP/2-prior-knowledge
+#             dialing (most don't by default), and the only consistently
+#             working path was port 443. Fix: port 80 is now plain
+#             HTTP/1.1 ("listen 80;", no http2 param) serving HTTP Upgrade
+#             only; XHTTP is TLS-only (port 443), where ALPN correctly
+#             negotiates h2 vs HTTP/1.1 on the same socket regardless of
+#             nginx version.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -235,7 +261,7 @@ print_banner() {
     echo "  ║                                                                  ║"
     echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade           v5.0.0     ║"
     echo "  ║   Front-end : nginx (content-type-switched router)              ║"
-    echo "  ║   Port 80   : nginx → XHTTP + HTTP Upgrade  (h2c)               ║"
+    echo "  ║   Port 80   : nginx → HTTP Upgrade only  (HTTP/1.1)             ║"
     echo "  ║   Port 443  : nginx → XHTTP + HTTP Upgrade  (TLS, LE cert)      ║"
     echo "  ║   CDN       : Cloudflare / CloudFront / Fastly compatible       ║"
     echo "  ║   OS        : Ubuntu 24.04 LTS                                  ║"
@@ -769,7 +795,7 @@ SYSTEMD_EOF
 
     if cmd_exists ufw; then
         ufw allow OpenSSH                                  >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 80/tcp  comment 'nginx — XHTTP+Upgrade NTLS/CDN' >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 80/tcp  comment 'nginx — HTTP Upgrade NTLS/CDN' >>"${INSTALL_LOG}" 2>&1 || true
         ufw allow 443/tcp comment 'nginx — XHTTP+Upgrade TLS'      >>"${INSTALL_LOG}" 2>&1 || true
         msg_ok "UFW: ports 22, 80 and 443 opened. Inner Xray ports stay loopback-only."
     else
@@ -780,42 +806,37 @@ SYSTEMD_EOF
     msg_step "Step 10/10 — Configuring nginx as the public-facing router"
     #
     # nginx owns ports 80 and 443. It terminates TLS itself on 443 (Let's
-    # Encrypt cert from Step 6) and is a real h2/h2c server on both ports —
-    # listen 80 http2 and listen 443 ssl http2 both work on nginx 1.18+.
+    # Encrypt cert from Step 6). Port 443 negotiates HTTP/1.1 vs HTTP/2 via
+    # TLS ALPN (works on any nginx version). Port 80 is plain HTTP/1.1 only
+    # — see the FIX comment on the port-80 server block below for why.
     #
-    # FIX (see inline comments in the generated nginx config below for the
-    # full explanation, sources, and confidence levels): the previous
-    # version used an exact-match "location =" for the XHTTP path and a
-    # runtime if($content_type) dispatch between grpc_pass and proxy_pass.
-    # Neither survived verification against primary sources. What IS
-    # verified:
-    #   - XHTTP always requests sub-paths under the configured path
-    #     (/<path>/<session-uuid>, /<path>/<session-uuid>/<seq> for
-    #     packet-up) — confirmed via a real nginx error log in
-    #     XTLS/Xray-core discussion #5822 ("VLESS/XHTTP + Nginx is not
-    #     working"). The nginx location MUST be a prefix match.
-    #   - The official Xray-examples nginx template for XHTTP
-    #     (XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf) uses a single,
-    #     unconditional grpc_pass in a prefix-match location — no
-    #     content-type branching.
-    #   - mode=auto negotiates to stream-up over TLS+H2, and stream-up adds
-    #     a default gRPC-style header disguise specifically so it passes
-    #     through nginx's grpc_pass and CDNs' gRPC features — confirmed in
-    #     XTLS/Xray-core discussion #4113 (RPRX's own write-up). The same
-    #     discussion's troubleshooting section is unconditional: if XHTTP
-    #     doesn't get through nginx, switch proxy_pass to grpc_pass — not
-    #     "branch between them."
-    #   - HTTP Upgrade is a plain HTTP/1.1 `Connection: Upgrade` handshake
-    #     targeting a single fixed path (never sub-paths), so it keeps its
-    #     own exact-match location and plain proxy_pass — unchanged.
-    #
-    # LOWER-CONFIDENCE / UNVERIFIED, flagged rather than asserted as fact:
-    # whether client apps reliably negotiate cleartext h2c (required for
-    # grpc_pass) on port 80 without TLS was not confirmed against a primary
-    # source. If XHTTP specifically on port 80 still fails after this fix,
-    # the documented fallback (XTLS/Xray-core discussion #4113) is mode=
-    # "packet-up" on both client and server with plain proxy_pass, which is
-    # chunked HTTP/1.1 and doesn't depend on h2c.
+    # FIX (see inline comments in the generated nginx config for the full
+    # explanation, sources, and a v5.0.1/v5.0.2 patch-note summary at the
+    # top of the file): two separate connection-breaking bugs were found
+    # and fixed here, both root-caused against a live deployment rather
+    # than assumed:
+    #   1. The XHTTP nginx location used an exact match ("location =") for
+    #      a transport that always requests sub-paths under the configured
+    #      path (/<path>/<session-uuid>) — confirmed via a real nginx error
+    #      log in XTLS/Xray-core discussion #5822. Every real XHTTP request
+    #      404'd. Fixed: prefix-match location, matching the official
+    #      XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf template, with
+    #      a single unconditional grpc_pass instead of an unverified
+    #      runtime if($content_type) dispatch between grpc_pass/proxy_pass.
+    #   2. "listen 80 http2;" makes a cleartext nginx socket HTTP/2-ONLY
+    #      with no HTTP/1.1 fallback on nginx < 1.25.1 — and Ubuntu 24.04's
+    #      stock nginx is 1.24.0. This was confirmed live: curl against
+    #      port 80 returned "Received HTTP/0.9 when not allowed", the
+    #      exact signature of an HTTP/1.1 request hitting an h2c-only
+    #      socket — and independently confirmed against nginx's own bug
+    #      tracker (trac.nginx.org/nginx/ticket/816: "HTTP/1.1 clients
+    #      will fail on the socket, preventing the use of HTTP Upgrade").
+    #      Fixed: port 80 is now plain HTTP/1.1, serving HTTP Upgrade only.
+    #      XHTTP is TLS-only (port 443), where ALPN handles the HTTP/1.1
+    #      vs HTTP/2 split correctly regardless of nginx version.
+    #   HTTP Upgrade is a plain HTTP/1.1 `Connection: Upgrade` handshake
+    #   targeting a single fixed path (never sub-paths), so it keeps its
+    #   exact-match location and plain proxy_pass on both ports — unchanged.
 
     mkdir -p /var/www/html
     if [[ ! -f /var/www/html/index.html ]]; then
@@ -829,15 +850,29 @@ HTML_EOF
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
     cat > /etc/nginx/sites-available/xray-router << NGINX_EOF
-# ── Port 80 — NTLS / CDN origin ─────────────────────────────────────────────
-# Real h2c (cleartext HTTP/2) listener — "listen 80 http2;" is valid, standard
-# nginx syntax for plain-HTTP2. Each location below uses a single transport
-# directive (grpc_pass for XHTTP, proxy_pass for HTTP Upgrade) — see the FIX
-# comment on the XHTTP location for why the previous content-type-switched
-# if/proxy_pass design was removed.
+# ── Port 80 — plain HTTP/1.1: HTTP Upgrade only ─────────────────────────────
+# FIX (live-debugged, root cause confirmed): "listen 80 http2;" makes this
+# socket HTTP/2-only with NO fallback to HTTP/1.1 on Ubuntu 24.04's stock
+# nginx package (1.24.0). Every plain HTTP/1.1 request — including the
+# HTTP Upgrade handshake this port exists to serve — gets rejected; nginx
+# tries to parse it as an HTTP/2 client preface and the client sees garbage
+# ("Received HTTP/0.9 when not allowed" from curl is the exact symptom of
+# this). Confirmed via nginx's own bug tracker: a cleartext "http2" listen
+# socket accepts ONLY prior-knowledge HTTP/2 and "HTTP/1.1 clients will
+# fail on the socket, preventing the use of HTTP Upgrade" — that limitation
+# was fixed in nginx 1.25.1, but Ubuntu 24.04 ships 1.24.0.
+# Source: https://trac.nginx.org/nginx/ticket/816 (closed/fixed in 1.25.1)
+# and https://trac.nginx.org/nginx/ticket/808.
+# Fix: drop "http2" from this listener (plain HTTP/1.1) and drop the XHTTP
+# location from this port entirely — grpc_pass requires nginx to actually
+# be speaking HTTP/2 to the client, which a plain HTTP/1.1 socket cannot
+# do. XHTTP is TLS-only in this deployment now (port 443, where ALPN
+# correctly negotiates h2 vs HTTP/1.1 on the same socket — see the FIX
+# comment on the port 443 block). HTTP Upgrade is unaffected: it's a real
+# HTTP/1.1 Connection:Upgrade handshake and works correctly on this socket.
 server {
-    listen 80 http2;
-    listen [::]:80 http2;
+    listen 80;
+    listen [::]:80;
     server_name ${DOMAIN};
 
     root /var/www/html;
@@ -847,50 +882,6 @@ server {
     client_body_timeout   1d;
     client_header_timeout 1d;
     keepalive_timeout     1d;
-
-    # XHTTP — FIX (connection-breaking bug, verified against
-    # XTLS/Xray-core discussion #5822, a real "VLESS/XHTTP+Nginx is not
-    # working" report whose nginx error log showed requests landing on
-    # "/database/<session-uuid>"): Xray's XHTTP transport never requests
-    # the bare path; every real request is a sub-path under it
-    # (/<path>/<uuid> and, for packet-up, /<path>/<uuid>/<seq>). The
-    # previous "location = /<path>" used an EXACT match, which can only
-    # ever match the bare path — every real XHTTP request 404'd, which is
-    # why no client could connect at all. Changed to a PREFIX match
-    # (trailing slash, no "="), identical in form to the official example
-    # at XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf.
-    #
-    # Also replaced the conditional "if ($content_type ~* grpc) {
-    # grpc_pass } proxy_pass" dispatch with a single, unconditional
-    # grpc_pass. That dispatch pattern is not used by any official Xray
-    # example or any working config found during review, and RPRX's own
-    # troubleshooting guidance in discussion #4113 is binary, not
-    # conditional: "无法穿透 Nginx 的话，把 Nginx 的 proxy_pass 改为
-    # grpc_pass" ("if it can't get through Nginx, change Nginx's
-    # proxy_pass to grpc_pass") — i.e. pick one directive, don't branch
-    # on it. Since server mode=auto + noGRPCHeader=false (unchanged below)
-    # negotiates to stream-up and sends the gRPC-style framing specifically
-    # so grpc_pass works (confirmed in discussion #4113), plain grpc_pass
-    # is the documented, verified choice. NOTE (lower confidence, flagged
-    # rather than silently assumed): grpc_pass requires nginx to actually
-    # receive an HTTP/2 connection from the client. That is well-verified
-    # over TLS on port 443 (ALPN negotiates h2). Whether client apps
-    # reliably negotiate cleartext h2c on port 80 without TLS was NOT
-    # confirmed against a primary source — if XHTTP on port 80 still
-    # fails after this fix, RPRX's documented fallback is to set mode to
-    # "packet-up" on both client and server and use plain proxy_pass
-    # instead of grpc_pass for that path, which is plain chunked
-    # HTTP/1.1 and does not depend on h2c.
-    location /${XHTTP_PATH#/}/ {
-        client_max_body_size 0;
-        client_body_buffer_size 512k;
-        grpc_read_timeout 1d;
-        grpc_send_timeout 1d;
-        grpc_set_header Host \$host;
-        grpc_set_header X-Real-IP \$remote_addr;
-        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
-    }
 
     # HTTP Upgrade — always a real HTTP/1.1 Connection:Upgrade handshake,
     # never gRPC, so this is plain proxy_pass with Upgrade headers.
@@ -916,10 +907,13 @@ server {
 }
 
 # ── Port 443 — TLS direct (Let's Encrypt cert, no CDN in front) ────────────
-# Same per-transport-directive pattern as port 80, over TLS. TLS+H2 (ALPN
-# negotiates h2) is the well-verified condition under which XHTTP's
-# mode=auto selects stream-up and sends gRPC-disguised frames, so this is
-# the primary, best-supported path — see the FIX comment on port 80.
+# XHTTP is now TLS-only (this block) — see the patch-note summary near the
+# top of this file (v5.0.2) for why it was removed from port 80. TLS+H2
+# (ALPN negotiates h2) is the well-verified condition under which XHTTP's
+# mode=auto selects stream-up and sends gRPC-disguised frames, and ALPN
+# correctly serves HTTP/1.1 and HTTP/2 on the same socket regardless of
+# nginx version, which is why this port (not 80) is the reliable path for
+# both transports.
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
@@ -938,11 +932,9 @@ server {
     client_header_timeout 1d;
     keepalive_timeout     1d;
 
-    # XHTTP — same FIX as the port-80 block above: prefix match instead of
-    # exact match (Xray requests /${XHTTP_PATH}/<session-uuid>, never the
-    # bare path — see comment on the port-80 block for the verified
-    # source), and a single unconditional grpc_pass instead of the
-    # unverified content-type-switched if/proxy_pass hybrid.
+    # XHTTP — prefix-match location (Xray requests /${XHTTP_PATH}/<session-uuid>,
+    # never the bare path) with a single unconditional grpc_pass. See the
+    # v5.0.1 patch note near the top of this file for the verified sources.
     location /${XHTTP_PATH#/}/ {
         client_max_body_size 0;
         client_body_buffer_size 512k;
@@ -1011,7 +1003,7 @@ NGINX_EOF
     echo -e "  ${WHITE}Domain         :${NC} ${DOMAIN}"
     echo -e "  ${WHITE}XHTTP path     :${NC} ${XHTTP_PATH}"
     echo -e "  ${WHITE}Upgrade path   :${NC} ${UPGRADE_PATH}"
-    echo -e "  ${WHITE}Port 80        :${NC} nginx — XHTTP + HTTP Upgrade, h2c (CDN-friendly)"
+    echo -e "  ${WHITE}Port 80        :${NC} nginx — HTTP Upgrade only, plain HTTP/1.1"
     echo -e "  ${WHITE}Port 443       :${NC} nginx — XHTTP + HTTP Upgrade, TLS (Let's Encrypt cert)"
     echo -e "  ${WHITE}Internal ports :${NC} ${PORT_XHTTP_INNER} (XHTTP) / ${PORT_UPGRADE_INNER} (Upgrade) — loopback only"
     echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
@@ -1327,10 +1319,10 @@ check_status() {
 
     echo -e "  ${WHITE}${BOLD}Public (nginx):${NC}"
     if [[ -n "${P80_INFO}" ]]; then
-        echo -e "  Port 80   (nginx, XHTTP+Upgrade h2c)  : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 80   (nginx, HTTP Upgrade, HTTP/1.1) : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P80_INFO}${NC}"
     else
-        echo -e "  Port 80   (nginx, XHTTP+Upgrade h2c)  : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 80   (nginx, HTTP Upgrade, HTTP/1.1) : ${RED}○ NOT LISTENING${NC}"
     fi
 
     if [[ -n "${P443_INFO}" ]]; then
@@ -1560,7 +1552,7 @@ show_menu() {
     echo -e "  ${WHITE}${BOLD}Select an option:${NC}"
     echo ""
     echo -e "  ${CYAN}  1.${NC}  ${GREEN}Install Xray-core${NC} (XHTTP + CDN Optimised)"
-    echo -e "         ${DIM}Install Xray with VLESS+XHTTP on ports 80 and 443${NC}"
+    echo -e "         ${DIM}Install Xray: VLESS+XHTTP on :443, HTTP Upgrade on :80 and :443${NC}"
     echo ""
     echo -e "  ${CYAN}  2.${NC}  ${GREEN}Add User${NC}"
     echo -e "         ${DIM}Generate a UUID and add a new VLESS user${NC}"
