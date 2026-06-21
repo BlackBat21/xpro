@@ -6,21 +6,35 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 3.0.0
+# xray-xhttp-manager.sh  ·  Version 4.0.0
 # =============================================================================
-# Description : Automates the full lifecycle of Xray-core using XHTTP and
-#               HTTP Upgrade transports on Ubuntu 24.04 LTS.
-#               · Port 80   — XHTTP        NTLS (CDN mode; CDN terminates TLS)
-#               · Port 443  — XHTTP        TLS  (direct; Let's Encrypt cert)
-#               · Port 8880 — HTTP Upgrade NTLS (CDN mode, dedicated port)
-#               · Port 8443 — HTTP Upgrade TLS  (direct, dedicated port)
+# Description : Automates the full lifecycle of Xray-core, fronted by nginx,
+#               using XHTTP and HTTP Upgrade transports — both on the
+#               standard ports 80 and 443 — on Ubuntu 24.04 LTS.
+#               · Port 80   — nginx, HTTP Upgrade only (NTLS / CDN origin)
+#               · Port 443  — nginx, XHTTP + HTTP Upgrade, both via TLS
+#               · Xray itself never binds 80 or 443. It listens on two
+#                 internal loopback-only ports; nginx is the only public
+#                 listener and routes by path to the right Xray inbound.
 #               · Protocol : VLESS (zero-overhead, CDN-friendly)
 #               · CDN      : Cloudflare and compatible providers
-#               · Design   : Each transport is a fully independent VLESS
-#                            inbound on its own port. NO fallbacks, NO
-#                            shared ports, NO inner/outer routing split.
-#                            XHTTP inbounds are byte-for-byte identical to
-#                            the original proven-working v2.3.0 design.
+#               · Why nginx in front: VLESS's own path-based fallback
+#                 mechanism cannot parse HTTP/2 or XHTTP framing — only
+#                 plaintext HTTP/1.1 request lines — so trying to share
+#                 80/443 between two transports with Xray alone is
+#                 fundamentally unreliable. nginx is a real HTTP server;
+#                 its location path-matching works regardless of HTTP
+#                 version or transport framing.
+#               · Why XHTTP needs its own TLS-only port: XHTTP behind
+#                 nginx must use grpc_pass (not proxy_pass) because its
+#                 framing is HTTP/2 stream-based; proxy_pass is built for
+#                 buffered HTTP/1.1 request/response and breaks it. nginx
+#                 can only negotiate HTTP/2 safely per-connection via TLS
+#                 ALPN — there is no cleartext (h2c) mode that can safely
+#                 coexist with plain HTTP/1.1 in the same nginx server
+#                 block, which port 80 also needs for the Upgrade
+#                 handshake and static decoy content. So: XHTTP → 443
+#                 only; HTTP Upgrade → both 80 and 443.
 #
 # Patch notes :
 #   v2.1.0 — All read -rp replaced with echo + read -r (Android SSH fix)
@@ -36,12 +50,26 @@
 #             fallbacks can't parse HTTP/2 frames (h2 ALPN caused silent
 #             disconnects), require a catch-all entry or every unmatched
 #             connection is dropped, and add an inner/outer split that
-#             desyncs path values during any future edit. None of that
-#             complexity exists in this design. The original XHTTP inbounds
-#             are untouched from the proven-working v2.3.0 config; HTTP
-#             Upgrade is simply two more independent inbounds, same pattern,
-#             different ports. If your DNS/CDN setup can route additional
-#             ports, this is the version to use.
+#             desyncs path values during any future edit.
+#   v4.0.0 — Replaced dedicated ports (8880/8443) with nginx as a real
+#             reverse proxy in front of Xray, restoring 80/443 as the only
+#             public ports as originally requested. Xray's XHTTP and HTTP
+#             Upgrade inbounds moved to internal loopback ports with no
+#             "path" set (nginx now owns path validation — setting path on
+#             both layers is a documented conflict that silently breaks
+#             responses: github.com/XTLS/Xray-core/discussions/5822).
+#             XHTTP uses grpc_pass per Xray's own official nginx reference
+#             (github.com/XTLS/Xray-examples, VLESS-XHTTP3-Nginx) since
+#             proxy_pass cannot relay XHTTP's HTTP/2 stream framing.
+#             Client mode set to packet-up, the officially documented
+#             "maximum compatibility behind a reverse proxy / CDN" mode.
+#             IMPORTANT CONSTRAINT discovered during this build: XHTTP via
+#             grpc_pass requires HTTP/2, and nginx can only negotiate HTTP/2
+#             safely on a per-connection basis through TLS ALPN — there is
+#             no cleartext equivalent that coexists with plain HTTP/1.1 in
+#             the same server block. So XHTTP is TLS-only (port 443); HTTP
+#             Upgrade, being genuine HTTP/1.1 Connection:Upgrade, works
+#             cleartext and is available on both 80 and 443.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -88,8 +116,11 @@ ACME_BIN="${ACME_HOME}/acme.sh"
 
 PORT_TLS=443
 PORT_NTLS=80
-PORT_UPGRADE_TLS=8443
-PORT_UPGRADE_NTLS=8880
+# Internal-only loopback ports — never exposed publicly. nginx terminates
+# TLS and does path-based routing on 80/443, then hands off plaintext
+# HTTP/2 (XHTTP) or HTTP/1.1 Upgrade (HTTP Upgrade) to these loopback ports.
+PORT_XHTTP_INNER=20080
+PORT_UPGRADE_INNER=20081
 
 XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 XRAY_DL_BASE="https://github.com/XTLS/Xray-core/releases/download"
@@ -189,11 +220,10 @@ print_banner() {
     echo "  ║                                                                  ║"
     echo "  ║       X R A Y - C O R E   ·   X H T T P   M A N A G E R        ║"
     echo "  ║                                                                  ║"
-    echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade           v3.0.0     ║"
-    echo "  ║   Port 80   : XHTTP NTLS         (CDN mode)                     ║"
-    echo "  ║   Port 443  : XHTTP TLS          (Direct, LE cert)              ║"
-    echo "  ║   Port 8880 : HTTP Upgrade NTLS  (CDN mode, dedicated)          ║"
-    echo "  ║   Port 8443 : HTTP Upgrade TLS   (Direct, dedicated)            ║"
+    echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade           v4.0.0     ║"
+    echo "  ║   Front-end : nginx (TLS-terminating, path-based router)        ║"
+    echo "  ║   Port 80   : nginx → HTTP Upgrade  (NTLS / CDN origin)         ║"
+    echo "  ║   Port 443  : nginx → XHTTP + HTTP Upgrade  (TLS, LE cert)      ║"
     echo "  ║   CDN       : Cloudflare / CloudFront / Fastly compatible       ║"
     echo "  ║   OS        : Ubuntu 24.04 LTS                                  ║"
     echo "  ║                                                                  ║"
@@ -285,7 +315,7 @@ install_xray() {
     fi
 
     # ── Step 1: Conflict checks ────────────────────────────────────────────────
-    msg_step "Step 1/9 — Checking for port and service conflicts"
+    msg_step "Step 1/10 — Checking for port and service conflicts"
     check_webserver_conflict
 
     if is_port_in_use 80; then
@@ -303,7 +333,7 @@ install_xray() {
     msg_ok "Port 443 is available."
 
     # ── Step 2: Domain input ───────────────────────────────────────────────────
-    msg_step "Step 2/9 — Domain configuration"
+    msg_step "Step 2/10 — Domain configuration"
     echo -e "  ${WHITE}Enter the fully-qualified domain name for this server.${NC}"
     echo -e "  ${DIM}Example: vpn.example.com${NC}"
     echo ""
@@ -328,7 +358,7 @@ install_xray() {
     msg_ok "Domain accepted: ${WHITE}${DOMAIN}${NC}"
 
     # ── Step 3: DNS check ──────────────────────────────────────────────────────
-    msg_step "Step 3/9 — DNS resolution check"
+    msg_step "Step 3/10 — DNS resolution check"
     SERVER_IP="$(curl -s -4 --connect-timeout 8 https://api.ipify.org 2>/dev/null || \
                  curl -s -4 --connect-timeout 8 https://ifconfig.me  2>/dev/null || \
                  echo 'unknown')"
@@ -357,7 +387,7 @@ install_xray() {
     { echo "=== Xray Install Log — $(date) ==="; echo "Domain: ${DOMAIN}"; } > "${INSTALL_LOG}"
 
     # ── Step 4: Dependencies ───────────────────────────────────────────────────
-    msg_step "Step 4/9 — Installing system dependencies"
+    msg_step "Step 4/10 — Installing system dependencies"
     msg_info "Running apt-get update..."
     if ! apt-get update -y >>"${INSTALL_LOG}" 2>&1; then
         msg_err "apt-get update failed. Check your internet connection." "exit"
@@ -365,7 +395,7 @@ install_xray() {
     msg_ok "Package lists updated."
 
     local -a DEPS=("curl" "wget" "unzip" "jq" "uuid-runtime" \
-                   "socat" "dnsutils" "qrencode" "openssl")
+                   "socat" "dnsutils" "qrencode" "openssl" "nginx")
     for dep in "${DEPS[@]}"; do
         if cmd_exists "${dep}"; then
             msg_ok "${dep} — already installed."
@@ -378,8 +408,15 @@ install_xray() {
         fi
     done
 
+    # nginx is installed now but must NOT be running yet — acme.sh standalone
+    # mode (Step 6) needs port 80 completely free to issue the certificate.
+    # nginx is configured and started in the new final step, after Xray and
+    # the certificate both exist.
+    systemctl stop nginx 2>/dev/null || true
+    systemctl disable nginx >>"${INSTALL_LOG}" 2>&1 || true
+
     # ── Step 5: acme.sh ────────────────────────────────────────────────────────
-    msg_step "Step 5/9 — Setting up acme.sh (Let's Encrypt client)"
+    msg_step "Step 5/10 — Setting up acme.sh (Let's Encrypt client)"
     if [[ -f "${ACME_BIN}" ]]; then
         msg_ok "acme.sh already installed."
         export PATH="${ACME_HOME}:${PATH}"
@@ -398,7 +435,7 @@ install_xray() {
     msg_ok "CA set: Let's Encrypt."
 
     # ── Step 6: SSL certificate ────────────────────────────────────────────────
-    msg_step "Step 6/9 — Issuing SSL certificate for ${DOMAIN}"
+    msg_step "Step 6/10 — Issuing SSL certificate for ${DOMAIN}"
     echo -e "  ${WHITE}acme.sh standalone${NC} will start a temporary HTTP server on port 80."
     echo -e "  ${YELLOW}Requirements:${NC}"
     echo -e "   • Port 80 reachable from the internet."
@@ -409,8 +446,9 @@ install_xray() {
     [[ "${CERT_CONFIRM,,}" == "n" ]] && { msg_info "Cancelled."; press_enter; return; }
 
     mkdir -p "${CERT_DIR}"
-    msg_info "Stopping Xray temporarily to free port 80..."
-    systemctl stop xray 2>/dev/null || true
+    msg_info "Stopping Xray and nginx temporarily to free port 80..."
+    systemctl stop xray  2>/dev/null || true
+    systemctl stop nginx 2>/dev/null || true
     sleep 1
     msg_info "Issuing certificate (~30–60 seconds)..."
     if ! "${ACME_BIN}" --issue --standalone -d "${DOMAIN}" \
@@ -432,8 +470,8 @@ install_xray() {
     if ! "${ACME_BIN}" --install-cert -d "${DOMAIN}" --ecc \
          --key-file       "${CERT_KEY}"       \
          --fullchain-file "${CERT_FULLCHAIN}" \
-         --pre-hook  "systemctl stop  xray 2>/dev/null; true" \
-         --post-hook "systemctl start xray 2>/dev/null; true" \
+         --pre-hook  "systemctl stop  nginx 2>/dev/null; true" \
+         --post-hook "systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null; true" \
          >>"${INSTALL_LOG}" 2>&1; then
         msg_err "Certificate copy failed. See ${INSTALL_LOG}." "exit"
     fi
@@ -442,7 +480,7 @@ install_xray() {
     msg_ok "Certificate installed. Auto-renewal hooks registered."
 
     # ── Step 7: Download Xray binary ───────────────────────────────────────────
-    msg_step "Step 7/9 — Downloading and installing Xray-core"
+    msg_step "Step 7/10 — Downloading and installing Xray-core"
 
     local ARCH XRAY_ARCH
     ARCH="$(uname -m)"
@@ -510,7 +548,7 @@ install_xray() {
     msg_ok "Geo-data ready: $(ls -lh ${GEO_DIR}/*.dat | awk '{print $5, $9}' | tr '\n' '  ')"
 
     # ── Step 8: Config files ───────────────────────────────────────────────────
-    msg_step "Step 8/9 — Creating configuration files"
+    msg_step "Step 8/10 — Creating configuration files"
 
     local XHTTP_PATH UPGRADE_PATH
     XHTTP_PATH="/$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
@@ -532,14 +570,18 @@ install_xray() {
     msg_ok "Initial user: ${WHITE}${INIT_USER}${NC}  UUID: ${WHITE}${INIT_UUID}${NC}"
 
     # Write config.json
-    # Four inbounds, each transport fully independent — NO fallbacks, NO
-    # shared ports, NO inner/outer split. This mirrors the proven-working
-    # XHTTP-only design exactly; HTTP Upgrade simply gets its own two ports
-    # instead of trying to share 80/443 with XHTTP via TCP fallback routing.
-    #   xhttp-ntls-p80      — port 80,   XHTTP,        no TLS (CDN upstream)
-    #   xhttp-tls-p443      — port 443,  XHTTP,        TLS direct (LE cert)
-    #   upgrade-ntls-p8880  — port 8880, HTTP Upgrade, no TLS (CDN upstream)
-    #   upgrade-tls-p8443   — port 8443, HTTP Upgrade, TLS direct (LE cert)
+    # Two INTERNAL, loopback-only inbounds. nginx owns ports 80 and 443
+    # publicly, terminates TLS itself, and routes by path to whichever
+    # inbound matches — XHTTP requests go to xhttp-inner via grpc_pass
+    # (XHTTP's mode:auto/packet-up speaks HTTP/2 framing, which only
+    # nginx's grpc_pass understands correctly — proxy_pass breaks it),
+    # HTTP Upgrade requests go to upgrade-inner via proxy_pass with
+    # Connection:Upgrade headers (it's a real HTTP/1.1 upgrade, like
+    # WebSocket). Neither inner inbound sets "path" or "host" in its
+    # settings — nginx already validated and stripped the path, and
+    # setting it again on the Xray side causes a documented conflict
+    # where Xray accepts the request but the client never gets a
+    # response. See: github.com/XTLS/Xray-core/discussions/5822
     # Routing: block private/LAN IPs to prevent SSRF (uses geoip:private
     # from the geo files we just downloaded)
     cat > "${CONFIG_FILE}" << EOF
@@ -551,16 +593,15 @@ install_xray() {
   },
   "inbounds": [
     {
-      "tag": "xhttp-ntls-p80",
-      "port": ${PORT_NTLS},
-      "listen": "0.0.0.0",
+      "tag": "xhttp-inner",
+      "port": ${PORT_XHTTP_INNER},
+      "listen": "127.0.0.1",
       "protocol": "vless",
       "settings": {
         "clients": [
           {
             "id": "${INIT_UUID}",
-            "email": "${INIT_USER}",
-            "flow": ""
+            "email": "${INIT_USER}"
           }
         ],
         "decryption": "none"
@@ -569,9 +610,7 @@ install_xray() {
         "network": "xhttp",
         "security": "none",
         "xhttpSettings": {
-          "host": "${DOMAIN}",
-          "path": "${XHTTP_PATH}",
-          "mode": "auto",
+          "mode": "packet-up",
           "extra": {
             "scMaxEachPostBytes": 1000000,
             "scMinPostsIntervalMs": 30,
@@ -580,67 +619,18 @@ install_xray() {
           }
         }
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
+      "sniffing": { "enabled": false }
     },
     {
-      "tag": "xhttp-tls-p443",
-      "port": ${PORT_TLS},
-      "listen": "0.0.0.0",
+      "tag": "upgrade-inner",
+      "port": ${PORT_UPGRADE_INNER},
+      "listen": "127.0.0.1",
       "protocol": "vless",
       "settings": {
         "clients": [
           {
             "id": "${INIT_UUID}",
-            "email": "${INIT_USER}",
-            "flow": ""
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "security": "tls",
-        "tlsSettings": {
-          "minVersion": "1.2",
-          "alpn": ["h2", "http/1.1"],
-          "certificates": [
-            {
-              "certificateFile": "${CERT_FULLCHAIN}",
-              "keyFile": "${CERT_KEY}"
-            }
-          ]
-        },
-        "xhttpSettings": {
-          "host": "${DOMAIN}",
-          "path": "${XHTTP_PATH}",
-          "mode": "auto",
-          "extra": {
-            "scMaxEachPostBytes": 1000000,
-            "scMinPostsIntervalMs": 30,
-            "xPaddingBytes": "100-1000",
-            "noGRPCHeader": false
-          }
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
-    },
-    {
-      "tag": "upgrade-ntls-p8880",
-      "port": ${PORT_UPGRADE_NTLS},
-      "listen": "0.0.0.0",
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${INIT_UUID}",
-            "email": "${INIT_USER}",
-            "flow": ""
+            "email": "${INIT_USER}"
           }
         ],
         "decryption": "none"
@@ -648,53 +638,9 @@ install_xray() {
       "streamSettings": {
         "network": "httpupgrade",
         "security": "none",
-        "httpupgradeSettings": {
-          "host": "${DOMAIN}",
-          "path": "${UPGRADE_PATH}"
-        }
+        "httpupgradeSettings": {}
       },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
-    },
-    {
-      "tag": "upgrade-tls-p8443",
-      "port": ${PORT_UPGRADE_TLS},
-      "listen": "0.0.0.0",
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${INIT_UUID}",
-            "email": "${INIT_USER}",
-            "flow": ""
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "httpupgrade",
-        "security": "tls",
-        "tlsSettings": {
-          "minVersion": "1.2",
-          "alpn": ["http/1.1"],
-          "certificates": [
-            {
-              "certificateFile": "${CERT_FULLCHAIN}",
-              "keyFile": "${CERT_KEY}"
-            }
-          ]
-        },
-        "httpupgradeSettings": {
-          "host": "${DOMAIN}",
-          "path": "${UPGRADE_PATH}"
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
-      }
+      "sniffing": { "enabled": false }
     }
   ],
   "outbounds": [
@@ -739,14 +685,14 @@ EOF
     msg_ok "config.json written to ${CONFIG_FILE}."
 
     # ── Step 9: systemd service + firewall ─────────────────────────────────────
-    msg_step "Step 9/9 — Creating systemd service and configuring firewall"
+    msg_step "Step 9/10 — Creating systemd service and configuring firewall"
 
     # v2.3.0 KEY FIX: The Environment= line tells Xray exactly where to find
     # geoip.dat and geosite.dat. Without this, Xray defaults to searching
     # /usr/local/bin/ or the binary's directory — neither of which has the files.
     cat > "${SERVICE_FILE}" << SYSTEMD_EOF
 [Unit]
-Description=Xray-core (VLESS+XHTTP Transport)
+Description=Xray-core (VLESS+XHTTP/HTTPUpgrade, internal — fronted by nginx)
 Documentation=https://github.com/XTLS/Xray-core
 After=network.target nss-lookup.target
 
@@ -801,14 +747,174 @@ SYSTEMD_EOF
     fi
 
     if cmd_exists ufw; then
-        ufw allow OpenSSH                                     >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 80/tcp  comment 'Xray XHTTP NTLS CDN'      >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 443/tcp comment 'Xray XHTTP TLS direct'    >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow "${PORT_UPGRADE_NTLS}/tcp" comment 'Xray Upgrade NTLS CDN'   >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow "${PORT_UPGRADE_TLS}/tcp"  comment 'Xray Upgrade TLS direct' >>"${INSTALL_LOG}" 2>&1 || true
-        msg_ok "UFW: ports 22, 80, 443, ${PORT_UPGRADE_NTLS} and ${PORT_UPGRADE_TLS} opened."
+        ufw allow OpenSSH                                  >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 80/tcp  comment 'nginx — HTTP Upgrade NTLS/CDN'  >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 443/tcp comment 'nginx — XHTTP/Upgrade TLS'      >>"${INSTALL_LOG}" 2>&1 || true
+        msg_ok "UFW: ports 22, 80 and 443 opened. Inner Xray ports stay loopback-only."
     else
         msg_warn "UFW not found. Open ports 80/443 in your cloud security group manually."
+    fi
+
+    # ── Step 10: nginx reverse proxy (path-based router for both transports) ───
+    msg_step "Step 10/10 — Configuring nginx as the public-facing router"
+    #
+    # nginx owns ports 80 and 443. It terminates TLS itself (Let's Encrypt
+    # cert from Step 6) and splits incoming requests by path:
+    #   /${XHTTP_PATH}    → grpc_pass  → 127.0.0.1:${PORT_XHTTP_INNER}
+    #   /${UPGRADE_PATH}  → proxy_pass → 127.0.0.1:${PORT_UPGRADE_INNER}
+    #
+    # grpc_pass is required for XHTTP, not proxy_pass — XHTTP's mode:packet-up
+    # speaks HTTP/2 stream framing, and nginx's proxy_pass (built for buffered
+    # HTTP/1.1 request/response) cannot relay that correctly: it produces
+    # "upstream prematurely closed connection" errors and silent client-side
+    # hangs. grpc_pass natively understands HTTP/2 framing and passes it
+    # through cleanly. This matches Xray's own official reference config:
+    # github.com/XTLS/Xray-examples/blob/main/VLESS-XHTTP3-Nginx/nginx.conf
+    #
+    # HTTP Upgrade is the opposite: it really is an HTTP/1.1 `Connection:
+    # Upgrade` handshake (the same mechanism WebSocket uses), so it needs
+    # proxy_pass with explicit Upgrade/Connection headers, not grpc_pass.
+    #
+    # Any request to an unrecognized path returns 404, exactly mirroring
+    # the "must return 400/404, never 502" sanity check the Xray community
+    # uses to confirm nginx + Xray are wired correctly.
+
+    mkdir -p /var/www/html
+    if [[ ! -f /var/www/html/index.html ]]; then
+        cat > /var/www/html/index.html << 'HTML_EOF'
+<!DOCTYPE html>
+<html><head><title>Welcome</title></head>
+<body><h1>It works.</h1></body></html>
+HTML_EOF
+    fi
+
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+
+    cat > /etc/nginx/sites-available/xray-router << NGINX_EOF
+# ── Port 80 — HTTP Upgrade only (NTLS / CDN origin) ────────────────────────
+# XHTTP is NOT served here. grpc_pass requires HTTP/2, and nginx negotiates
+# HTTP/2 per-listener via TLS ALPN — there is no equivalent safe negotiation
+# on a cleartext port that can coexist with plain HTTP/1.1 in the same
+# server block. Forcing h2c cleartext on port 80 would break the plain
+# HTTP/1.1 Upgrade handshake and static-file serving in this same block.
+# This matches Xray's own official nginx reference, which only ever uses
+# grpc_pass on the TLS-terminated, http2-negotiated server block.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    root /var/www/html;
+    index index.html;
+
+    client_max_body_size 0;
+    client_body_timeout   5m;
+    client_header_timeout 5m;
+    keepalive_timeout     5m;
+
+    location = /${UPGRADE_PATH#/} {
+        if (\$http_upgrade != "websocket") { return 404; }
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:${PORT_UPGRADE_INNER};
+    }
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+
+# ── Port 443 — TLS direct (Let's Encrypt cert, no CDN in front) ────────────
+# Both transports live here. TLS lets nginx negotiate HTTP/2 via ALPN
+# automatically per-connection — h2 clients (XHTTP/grpc_pass) and HTTP/1.1
+# clients (the Upgrade handshake) are routed correctly without conflict,
+# which is impossible to do safely on a cleartext listener.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${CERT_FULLCHAIN};
+    ssl_certificate_key ${CERT_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    root /var/www/html;
+    index index.html;
+
+    client_max_body_size 0;
+    client_body_timeout   5m;
+    client_header_timeout 5m;
+    keepalive_timeout     5m;
+
+    location = /${XHTTP_PATH#/} {
+        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_read_timeout 315;
+        grpc_send_timeout 5m;
+    }
+    location /${XHTTP_PATH#/}/ {
+        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_read_timeout 315;
+        grpc_send_timeout 5m;
+    }
+
+    location = /${UPGRADE_PATH#/} {
+        if (\$http_upgrade != "websocket") { return 404; }
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:${PORT_UPGRADE_INNER};
+    }
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+NGINX_EOF
+
+    ln -sf /etc/nginx/sites-available/xray-router /etc/nginx/sites-enabled/xray-router
+
+    # Verify nginx actually has gRPC support compiled in. The stock Ubuntu
+    # 'nginx' apt package (nginx-core) includes ngx_http_grpc_module by
+    # default, but nginx-light does not — if grpc_pass is unrecognized,
+    # nginx -t fails with "unknown directive" which is confusing without
+    # this explicit check pointing at the real cause.
+    if ! nginx -V 2>&1 | grep -q 'http_v2_module\|grpc'; then
+        msg_warn "Could not confirm gRPC/HTTP2 module support in this nginx build."
+        msg_warn "If 'nginx -t' below fails with 'unknown directive grpc_pass',"
+        msg_warn "run: ${WHITE}apt-get install --reinstall nginx${NC} (not nginx-light)."
+    fi
+
+    if ! nginx -t >>"${INSTALL_LOG}" 2>&1; then
+        msg_err "nginx config test FAILED. Check: ${WHITE}nginx -t${NC} and ${INSTALL_LOG}"
+        press_enter; return
+    fi
+    msg_ok "nginx config syntax OK."
+
+    systemctl enable nginx  >>"${INSTALL_LOG}" 2>&1 || true
+    if ! systemctl restart nginx; then
+        msg_err "nginx failed to start. Run: ${WHITE}journalctl -u nginx -n 30 --no-pager${NC}"
+        press_enter; return
+    fi
+    sleep 1
+    if systemctl is-active --quiet nginx; then
+        msg_ok "nginx is ${GREEN}${BOLD}running${NC} and routing ports 80/443."
+    else
+        msg_warn "nginx may not be running — use Option 4 to investigate."
     fi
 
     separator
@@ -818,10 +924,9 @@ SYSTEMD_EOF
     echo -e "  ${WHITE}Domain         :${NC} ${DOMAIN}"
     echo -e "  ${WHITE}XHTTP path     :${NC} ${XHTTP_PATH}"
     echo -e "  ${WHITE}Upgrade path   :${NC} ${UPGRADE_PATH}"
-    echo -e "  ${WHITE}Port 80        :${NC} XHTTP NTLS         — CDN mode (Cloudflare orange cloud)"
-    echo -e "  ${WHITE}Port 443       :${NC} XHTTP TLS          — Direct mode (Let's Encrypt cert)"
-    echo -e "  ${WHITE}Port 8880      :${NC} HTTP Upgrade NTLS  — CDN mode (Cloudflare orange cloud)"
-    echo -e "  ${WHITE}Port 8443      :${NC} HTTP Upgrade TLS   — Direct mode (Let's Encrypt cert)"
+    echo -e "  ${WHITE}Port 80        :${NC} nginx — HTTP Upgrade only, NTLS (CDN-friendly)"
+    echo -e "  ${WHITE}Port 443       :${NC} nginx — XHTTP + HTTP Upgrade, TLS (Let's Encrypt cert)"
+    echo -e "  ${WHITE}Internal ports :${NC} ${PORT_XHTTP_INNER} (XHTTP) / ${PORT_UPGRADE_INNER} (Upgrade) — loopback only"
     echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
     echo -e "  ${WHITE}Geo-data       :${NC} ${GEO_DIR}/"
     echo ""
@@ -966,51 +1071,47 @@ view_client_config() {
     local PATH_ENC
     PATH_ENC="$(urlencode "${XHTTP_PATH}")"
 
-    # [A] CDN Mode — client connects to CDN:443, CDN proxies to our port 80
+    # [A] XHTTP CDN Mode — client:443 (or CDN edge) → nginx:443 → grpc_pass → xhttp-inner
+    # mode=packet-up is the most CDN/reverse-proxy-compatible XHTTP mode
+    # (official guidance: "if it can't get through other CDNs or proxy
+    # software, set mode to packet-up — strongest compatibility").
     local CDN_URL
     CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    CDN_URL+="?encryption=none&type=xhttp"
+    CDN_URL+="?encryption=none&type=xhttp&mode=packet-up"
     CDN_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
-    CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
+    CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2"
     CDN_URL+="#${SELECTED_USER}-XHTTP-CDN"
 
-    # [B] Direct TLS — client connects directly to our port 443
+    # [B] XHTTP Direct TLS — client connects straight to nginx:443 (no CDN)
     local DIRECT_URL
     DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    DIRECT_URL+="?encryption=none&type=xhttp"
+    DIRECT_URL+="?encryption=none&type=xhttp&mode=packet-up"
     DIRECT_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
-    DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
+    DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2"
     DIRECT_URL+="#${SELECTED_USER}-XHTTP-Direct-TLS"
-
-    # [C] NTLS — port 80, unencrypted — testing only
-    local NTLS_URL
-    NTLS_URL="vless://${USER_UUID}@${DOMAIN}:80"
-    NTLS_URL+="?encryption=none&type=xhttp"
-    NTLS_URL+="&path=${PATH_ENC}&host=${DOMAIN}&security=none"
-    NTLS_URL+="#${SELECTED_USER}-XHTTP-NTLS-TestOnly"
 
     local UPGRADE_ENC
     UPGRADE_ENC="$(urlencode "${UPGRADE_PATH}")"
 
-    # [D] HTTP Upgrade CDN Mode — client connects to CDN:8443, CDN proxies to our port 8880
+    # [D] HTTP Upgrade CDN Mode — client:443 (or CDN edge) → nginx:443 → proxy_pass (Upgrade)
     local UPGRADE_CDN_URL
-    UPGRADE_CDN_URL="vless://${USER_UUID}@${DOMAIN}:${PORT_UPGRADE_TLS}"
+    UPGRADE_CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
     UPGRADE_CDN_URL+="?encryption=none&type=httpupgrade"
     UPGRADE_CDN_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}"
     UPGRADE_CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
     UPGRADE_CDN_URL+="#${SELECTED_USER}-Upgrade-CDN"
 
-    # [E] HTTP Upgrade Direct TLS — client connects directly to our port 8443
+    # [E] HTTP Upgrade Direct TLS — client connects straight to nginx:443 (no CDN)
     local UPGRADE_DIRECT_URL
-    UPGRADE_DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:${PORT_UPGRADE_TLS}"
+    UPGRADE_DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
     UPGRADE_DIRECT_URL+="?encryption=none&type=httpupgrade"
     UPGRADE_DIRECT_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}"
     UPGRADE_DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
     UPGRADE_DIRECT_URL+="#${SELECTED_USER}-Upgrade-Direct-TLS"
 
-    # [F] HTTP Upgrade NTLS — port 8880, unencrypted — testing only
+    # [F] HTTP Upgrade NTLS — nginx:80, unencrypted — testing only
     local UPGRADE_NTLS_URL
-    UPGRADE_NTLS_URL="vless://${USER_UUID}@${DOMAIN}:${PORT_UPGRADE_NTLS}"
+    UPGRADE_NTLS_URL="vless://${USER_UUID}@${DOMAIN}:80"
     UPGRADE_NTLS_URL+="?encryption=none&type=httpupgrade"
     UPGRADE_NTLS_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}&security=none"
     UPGRADE_NTLS_URL+="#${SELECTED_USER}-Upgrade-NTLS-TestOnly"
@@ -1026,9 +1127,9 @@ view_client_config() {
     echo -e "  ${WHITE}Upgrade Path:${NC} ${UPGRADE_PATH}"
     echo ""
 
-    # ── [A] CDN ───────────────────────────────────────────────────────────────
+    # ── [A] XHTTP CDN ─────────────────────────────────────────────────────────
     separator
-    echo -e "  ${GREEN}${BOLD}[A]  CDN MODE — Client:443 → CDN → Origin:80${NC}"
+    echo -e "  ${GREEN}${BOLD}[A]  XHTTP CDN MODE — Client:443 → CDN → nginx:443 → Xray${NC}"
     echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
@@ -1041,9 +1142,9 @@ view_client_config() {
         echo ""
     fi
 
-    # ── [B] Direct TLS ────────────────────────────────────────────────────────
+    # ── [B] XHTTP Direct TLS ──────────────────────────────────────────────────
     separator
-    echo -e "  ${GREEN}${BOLD}[B]  DIRECT TLS — Client:443 → Origin:443 (no CDN)${NC}"
+    echo -e "  ${GREEN}${BOLD}[B]  XHTTP DIRECT TLS — Client:443 → nginx:443 (no CDN) → Xray${NC}"
     echo -e "  ${YELLOW}Use when:${NC} DNS is grey-cloud / DNS-only (no CDN proxy)."
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
@@ -1056,21 +1157,11 @@ view_client_config() {
         echo ""
     fi
 
-    # ── [C] NTLS ──────────────────────────────────────────────────────────────
+    # ── [C] HTTP Upgrade CDN ──────────────────────────────────────────────────
     separator
-    echo -e "  ${MAGENTA}${BOLD}[C]  XHTTP NTLS PORT 80 — Unencrypted — TESTING ONLY${NC}"
-    echo -e "  ${RED}  ⚠  Do NOT use in production. Traffic is plain-text.${NC}"
-    echo ""
-    echo -e "  ${WHITE}VLESS URL:${NC}"
-    echo -e "  ${CYAN}${NTLS_URL}${NC}"
-    echo ""
-    separator
-
-    # ── [D] HTTP Upgrade CDN ──────────────────────────────────────────────────
-    separator
-    echo -e "  ${GREEN}${BOLD}[D]  HTTP UPGRADE CDN MODE — Client:${PORT_UPGRADE_TLS} → CDN → Origin:${PORT_UPGRADE_NTLS}${NC}"
+    echo -e "  ${GREEN}${BOLD}[C]  HTTP UPGRADE CDN MODE — Client:80 → CDN → nginx:80 → Xray${NC}"
     echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
-    echo -e "  ${DIM}Dedicated port — does not share 443 with XHTTP.${NC}"
+    echo -e "  ${DIM}Port 80 is HTTP Upgrade's home — XHTTP requires TLS, see [A]/[B] above.${NC}"
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
     echo -e "  ${CYAN}${UPGRADE_CDN_URL}${NC}"
@@ -1082,9 +1173,9 @@ view_client_config() {
         echo ""
     fi
 
-    # ── [E] HTTP Upgrade Direct TLS ───────────────────────────────────────────
+    # ── [D] HTTP Upgrade Direct TLS ───────────────────────────────────────────
     separator
-    echo -e "  ${GREEN}${BOLD}[E]  HTTP UPGRADE DIRECT TLS — Client:${PORT_UPGRADE_TLS} → Origin:${PORT_UPGRADE_TLS} (no CDN)${NC}"
+    echo -e "  ${GREEN}${BOLD}[D]  HTTP UPGRADE DIRECT TLS — Client:443 → nginx:443 (no CDN) → Xray${NC}"
     echo -e "  ${YELLOW}Use when:${NC} DNS is grey-cloud / DNS-only (no CDN proxy)."
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
@@ -1097,9 +1188,9 @@ view_client_config() {
         echo ""
     fi
 
-    # ── [F] HTTP Upgrade NTLS ─────────────────────────────────────────────────
+    # ── [E] HTTP Upgrade NTLS ─────────────────────────────────────────────────
     separator
-    echo -e "  ${MAGENTA}${BOLD}[F]  HTTP UPGRADE NTLS PORT ${PORT_UPGRADE_NTLS} — Unencrypted — TESTING ONLY${NC}"
+    echo -e "  ${MAGENTA}${BOLD}[E]  HTTP UPGRADE NTLS — nginx:80, unencrypted — TESTING ONLY${NC}"
     echo -e "  ${RED}  ⚠  Do NOT use in production. Traffic is plain-text.${NC}"
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
@@ -1139,38 +1230,46 @@ check_status() {
     # [2] Ports
     echo -e "  ${WHITE}${BOLD}[ 2 ]  Port Listening Status${NC}"
     echo ""
-    local P80_INFO P443_INFO P8880_INFO P8443_INFO
+    local P80_INFO P443_INFO PXHTTP_INFO PUPGRADE_INFO NGINX_ACTIVE
     P80_INFO="$(ss -tlnp 2>/dev/null | grep ':80 ' || echo '')"
     P443_INFO="$(ss -tlnp 2>/dev/null | grep ':443 ' || echo '')"
-    P8880_INFO="$(ss -tlnp 2>/dev/null | grep ':8880 ' || echo '')"
-    P8443_INFO="$(ss -tlnp 2>/dev/null | grep ':8443 ' || echo '')"
+    PXHTTP_INFO="$(ss -tlnp 2>/dev/null | grep ":${PORT_XHTTP_INNER} " || echo '')"
+    PUPGRADE_INFO="$(ss -tlnp 2>/dev/null | grep ":${PORT_UPGRADE_INNER} " || echo '')"
+    NGINX_ACTIVE="$(systemctl is-active nginx 2>/dev/null || echo 'inactive')"
 
+    echo -e "  ${WHITE}${BOLD}Public (nginx):${NC}"
     if [[ -n "${P80_INFO}" ]]; then
-        echo -e "  Port 80   (XHTTP NTLS)   : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 80   (nginx, HTTP Upgrade NTLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P80_INFO}${NC}"
     else
-        echo -e "  Port 80   (XHTTP NTLS)   : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 80   (nginx, HTTP Upgrade NTLS)  : ${RED}○ NOT LISTENING${NC}"
     fi
 
     if [[ -n "${P443_INFO}" ]]; then
-        echo -e "  Port 443  (XHTTP TLS)    : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 443  (nginx, XHTTP+Upgrade TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P443_INFO}${NC}"
     else
-        echo -e "  Port 443  (XHTTP TLS)    : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 443  (nginx, XHTTP+Upgrade TLS)  : ${RED}○ NOT LISTENING${NC}"
     fi
 
-    if [[ -n "${P8880_INFO}" ]]; then
-        echo -e "  Port 8880 (Upgrade NTLS) : ${GREEN}${BOLD}● LISTENING${NC}"
-        echo -e "  ${DIM}  ${P8880_INFO}${NC}"
+    if [[ "${NGINX_ACTIVE}" == "active" ]]; then
+        echo -e "  nginx service                         : ${GREEN}${BOLD}● ${NGINX_ACTIVE}${NC}"
     else
-        echo -e "  Port 8880 (Upgrade NTLS) : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  nginx service                         : ${RED}○ ${NGINX_ACTIVE}${NC}"
     fi
 
-    if [[ -n "${P8443_INFO}" ]]; then
-        echo -e "  Port 8443 (Upgrade TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
-        echo -e "  ${DIM}  ${P8443_INFO}${NC}"
+    echo ""
+    echo -e "  ${WHITE}${BOLD}Internal (Xray, loopback-only — not exposed):${NC}"
+    if [[ -n "${PXHTTP_INFO}" ]]; then
+        echo -e "  Port ${PORT_XHTTP_INNER} (XHTTP inner)   : ${GREEN}${BOLD}● LISTENING${NC}"
     else
-        echo -e "  Port 8443 (Upgrade TLS)  : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port ${PORT_XHTTP_INNER} (XHTTP inner)   : ${RED}○ NOT LISTENING${NC}"
+    fi
+
+    if [[ -n "${PUPGRADE_INFO}" ]]; then
+        echo -e "  Port ${PORT_UPGRADE_INNER} (Upgrade inner) : ${GREEN}${BOLD}● LISTENING${NC}"
+    else
+        echo -e "  Port ${PORT_UPGRADE_INNER} (Upgrade inner) : ${RED}○ NOT LISTENING${NC}"
     fi
 
     echo ""
@@ -1306,10 +1405,18 @@ uninstall_xray() {
 
     msg_step "Uninstalling..."
 
-    systemctl stop    xray 2>/dev/null && msg_ok "Service stopped."   || \
-        msg_warn "Service was not running."
-    systemctl disable xray 2>/dev/null && msg_ok "Service disabled."  || \
-        msg_warn "Service was not enabled."
+    systemctl stop    xray  2>/dev/null && msg_ok "Xray service stopped."   || \
+        msg_warn "Xray service was not running."
+    systemctl disable xray  2>/dev/null && msg_ok "Xray service disabled."  || \
+        msg_warn "Xray service was not enabled."
+    systemctl stop    nginx 2>/dev/null && msg_ok "nginx stopped."          || \
+        msg_warn "nginx was not running."
+    systemctl disable nginx 2>/dev/null && msg_ok "nginx disabled."         || \
+        msg_warn "nginx was not enabled."
+
+    rm -f /etc/nginx/sites-enabled/xray-router \
+          /etc/nginx/sites-available/xray-router 2>/dev/null && \
+        msg_ok "Removed nginx xray-router config."
 
     [[ -f "${SERVICE_FILE}" ]]    && rm -f  "${SERVICE_FILE}"    && msg_ok "Removed: ${SERVICE_FILE}"
     [[ -f "${XRAY_BIN}" ]]        && rm -f  "${XRAY_BIN}"        && msg_ok "Removed: ${XRAY_BIN}"
@@ -1326,8 +1433,6 @@ uninstall_xray() {
     if cmd_exists ufw; then
         ufw delete allow 80/tcp  2>/dev/null && msg_ok "Removed UFW rule: 80."  || true
         ufw delete allow 443/tcp 2>/dev/null && msg_ok "Removed UFW rule: 443." || true
-        ufw delete allow 8880/tcp 2>/dev/null && msg_ok "Removed UFW rule: 8880." || true
-        ufw delete allow 8443/tcp 2>/dev/null && msg_ok "Removed UFW rule: 8443." || true
     fi
 
     if [[ "${RM_ACME,,}" == "y" ]]; then
