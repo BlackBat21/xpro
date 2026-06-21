@@ -585,16 +585,24 @@ install_xray() {
     # Write config.json
     # Two INTERNAL, loopback-only inbounds. nginx owns ports 80 and 443
     # publicly, terminates TLS itself, and routes by path to whichever
-    # inbound matches — XHTTP requests go to xhttp-inner via grpc_pass
-    # (XHTTP's mode:auto/packet-up speaks HTTP/2 framing, which only
-    # nginx's grpc_pass understands correctly — proxy_pass breaks it),
+    # inbound matches — XHTTP requests go to xhttp-inner via grpc_pass.
+    # FIX: previously claimed "mode:auto/packet-up speaks HTTP/2 framing" —
+    # that was backwards. packet-up is plain chunked HTTP/1.1 and does NOT
+    # pair with grpc_pass; it's mode=auto negotiating to stream-up under
+    # TLS+H2 that sends the gRPC-style framing grpc_pass expects (verified:
+    # XTLS/Xray-core discussion #4113). If grpc_pass ever fails to
+    # penetrate a given network path, the documented fallback is mode=
+    # packet-up on both sides with plain proxy_pass instead — not mixing
+    # the two on one path.
     # HTTP Upgrade requests go to upgrade-inner via proxy_pass with
     # Connection:Upgrade headers (it's a real HTTP/1.1 upgrade, like
     # WebSocket). Neither inner inbound sets "path" or "host" in its
-    # settings — nginx already validated and stripped the path, and
-    # setting it again on the Xray side causes a documented conflict
-    # where Xray accepts the request but the client never gets a
-    # response. See: github.com/XTLS/Xray-core/discussions/5822
+    # settings — nginx already does the path matching, and setting path
+    # again on the Xray side is a documented conflict: in
+    # github.com/XTLS/Xray-core/discussions/5822, a server that had path
+    # set in xhttpSettings accepted every request (visible in its own
+    # logs) but the client never received a response; removing path from
+    # xhttpSettings was the confirmed fix.
     # Routing: block private/LAN IPs to prevent SSRF (uses geoip:private
     # from the geo files we just downloaded)
     cat > "${CONFIG_FILE}" << EOF
@@ -775,30 +783,39 @@ SYSTEMD_EOF
     # Encrypt cert from Step 6) and is a real h2/h2c server on both ports —
     # listen 80 http2 and listen 443 ssl http2 both work on nginx 1.18+.
     #
-    # Architecture verified against a real, actively-maintained production
-    # script (GFW4Fun/x-ui-pro, github.com/GFW4Fun/x-ui-pro) and Xray's own
-    # official examples (XTLS/Xray-examples, VLESS-GRPC and VLESS-XHTTP3-Nginx)
-    # rather than designed from scratch. Both use ONE location per path that
-    # inspects the request's Content-Type at runtime and dispatches to either
-    # grpc_pass or proxy_pass from inside the SAME block — not two separate
-    # paths/ports for two transports.
+    # FIX (see inline comments in the generated nginx config below for the
+    # full explanation, sources, and confidence levels): the previous
+    # version used an exact-match "location =" for the XHTTP path and a
+    # runtime if($content_type) dispatch between grpc_pass and proxy_pass.
+    # Neither survived verification against primary sources. What IS
+    # verified:
+    #   - XHTTP always requests sub-paths under the configured path
+    #     (/<path>/<session-uuid>, /<path>/<session-uuid>/<seq> for
+    #     packet-up) — confirmed via a real nginx error log in
+    #     XTLS/Xray-core discussion #5822 ("VLESS/XHTTP + Nginx is not
+    #     working"). The nginx location MUST be a prefix match.
+    #   - The official Xray-examples nginx template for XHTTP
+    #     (XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf) uses a single,
+    #     unconditional grpc_pass in a prefix-match location — no
+    #     content-type branching.
+    #   - mode=auto negotiates to stream-up over TLS+H2, and stream-up adds
+    #     a default gRPC-style header disguise specifically so it passes
+    #     through nginx's grpc_pass and CDNs' gRPC features — confirmed in
+    #     XTLS/Xray-core discussion #4113 (RPRX's own write-up). The same
+    #     discussion's troubleshooting section is unconditional: if XHTTP
+    #     doesn't get through nginx, switch proxy_pass to grpc_pass — not
+    #     "branch between them."
+    #   - HTTP Upgrade is a plain HTTP/1.1 `Connection: Upgrade` handshake
+    #     targeting a single fixed path (never sub-paths), so it keeps its
+    #     own exact-match location and plain proxy_pass — unchanged.
     #
-    # XHTTP server mode is "auto", which negotiates to stream-up over TLS+H2.
-    # stream-up deliberately disguises its frames with a gRPC-style header
-    # specifically so it passes through nginx's grpc_pass and Cloudflare's
-    # gRPC feature (confirmed: XTLS/Xray-core discussion #4113). This was
-    # the actual bug in the previous version of this script: it paired
-    # mode=packet-up (plain chunked HTTP/1.1, never sends a gRPC content
-    # type) with an nginx config built entirely around grpc_pass — a
-    # mismatch that produces exactly the silent failures seen throughout
-    # testing. Content-Type detection only works when the client's mode
-    # is auto or stream-up; packet-up content reaching grpc_pass is
-    # malformed gRPC and is rejected or hangs.
-    #
-    # HTTP Upgrade is a real HTTP/1.1 `Connection: Upgrade` handshake (same
-    # mechanism as WebSocket) and always uses proxy_pass — it never sends
-    # a gRPC content type, so it always falls through to the proxy_pass
-    # branch in the same location block.
+    # LOWER-CONFIDENCE / UNVERIFIED, flagged rather than asserted as fact:
+    # whether client apps reliably negotiate cleartext h2c (required for
+    # grpc_pass) on port 80 without TLS was not confirmed against a primary
+    # source. If XHTTP specifically on port 80 still fails after this fix,
+    # the documented fallback (XTLS/Xray-core discussion #4113) is mode=
+    # "packet-up" on both client and server with plain proxy_pass, which is
+    # chunked HTTP/1.1 and doesn't depend on h2c.
 
     mkdir -p /var/www/html
     if [[ ! -f /var/www/html/index.html ]]; then
@@ -813,11 +830,11 @@ HTML_EOF
 
     cat > /etc/nginx/sites-available/xray-router << NGINX_EOF
 # ── Port 80 — NTLS / CDN origin ─────────────────────────────────────────────
-# Real h2c (cleartext HTTP/2) listener — this is a standard, documented nginx
-# capability (confirmed via XTLS/Xray-core discussion #3731's working nginx
-# config: "listen 80 http2 ...; listen 443 ssl http2 ...;" serving both ports
-# identically). XHTTP's stream-up frames disguise themselves as gRPC traffic
-# specifically so reverse proxies route them correctly without special cases.
+# Real h2c (cleartext HTTP/2) listener — "listen 80 http2;" is valid, standard
+# nginx syntax for plain-HTTP2. Each location below uses a single transport
+# directive (grpc_pass for XHTTP, proxy_pass for HTTP Upgrade) — see the FIX
+# comment on the XHTTP location for why the previous content-type-switched
+# if/proxy_pass design was removed.
 server {
     listen 80 http2;
     listen [::]:80 http2;
@@ -831,32 +848,55 @@ server {
     client_header_timeout 1d;
     keepalive_timeout     1d;
 
-    # XHTTP — one location, dispatches by Content-Type at request time.
-    # mode=auto on both client and server negotiates to stream-up, which
-    # sends a gRPC-style Content-Type specifically so this check succeeds.
-    location = /${XHTTP_PATH#/} {
+    # XHTTP — FIX (connection-breaking bug, verified against
+    # XTLS/Xray-core discussion #5822, a real "VLESS/XHTTP+Nginx is not
+    # working" report whose nginx error log showed requests landing on
+    # "/database/<session-uuid>"): Xray's XHTTP transport never requests
+    # the bare path; every real request is a sub-path under it
+    # (/<path>/<uuid> and, for packet-up, /<path>/<uuid>/<seq>). The
+    # previous "location = /<path>" used an EXACT match, which can only
+    # ever match the bare path — every real XHTTP request 404'd, which is
+    # why no client could connect at all. Changed to a PREFIX match
+    # (trailing slash, no "="), identical in form to the official example
+    # at XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf.
+    #
+    # Also replaced the conditional "if ($content_type ~* grpc) {
+    # grpc_pass } proxy_pass" dispatch with a single, unconditional
+    # grpc_pass. That dispatch pattern is not used by any official Xray
+    # example or any working config found during review, and RPRX's own
+    # troubleshooting guidance in discussion #4113 is binary, not
+    # conditional: "无法穿透 Nginx 的话，把 Nginx 的 proxy_pass 改为
+    # grpc_pass" ("if it can't get through Nginx, change Nginx's
+    # proxy_pass to grpc_pass") — i.e. pick one directive, don't branch
+    # on it. Since server mode=auto + noGRPCHeader=false (unchanged below)
+    # negotiates to stream-up and sends the gRPC-style framing specifically
+    # so grpc_pass works (confirmed in discussion #4113), plain grpc_pass
+    # is the documented, verified choice. NOTE (lower confidence, flagged
+    # rather than silently assumed): grpc_pass requires nginx to actually
+    # receive an HTTP/2 connection from the client. That is well-verified
+    # over TLS on port 443 (ALPN negotiates h2). Whether client apps
+    # reliably negotiate cleartext h2c on port 80 without TLS was NOT
+    # confirmed against a primary source — if XHTTP on port 80 still
+    # fails after this fix, RPRX's documented fallback is to set mode to
+    # "packet-up" on both client and server and use plain proxy_pass
+    # instead of grpc_pass for that path, which is plain chunked
+    # HTTP/1.1 and does not depend on h2c.
+    location /${XHTTP_PATH#/}/ {
         client_max_body_size 0;
         client_body_buffer_size 512k;
         grpc_read_timeout 1d;
         grpc_send_timeout 1d;
-        proxy_read_timeout 1d;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        grpc_set_header Host \$host;
         grpc_set_header X-Real-IP \$remote_addr;
-        if (\$content_type ~* "grpc") {
-            grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
-            break;
-        }
-        proxy_pass http://127.0.0.1:${PORT_XHTTP_INNER};
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
     }
 
     # HTTP Upgrade — always a real HTTP/1.1 Connection:Upgrade handshake,
     # never gRPC, so this is plain proxy_pass with Upgrade headers.
+    # (Verified: HTTPUpgrade always targets a single fixed path with no
+    # session sub-paths, per xtls.github.io/en/config/transports/httpupgrade.html,
+    # so the exact-match "location =" here is correct and was NOT changed.)
     location = /${UPGRADE_PATH#/} {
         if (\$http_upgrade != "websocket") { return 404; }
         proxy_http_version 1.1;
@@ -876,9 +916,10 @@ server {
 }
 
 # ── Port 443 — TLS direct (Let's Encrypt cert, no CDN in front) ────────────
-# Same single-location, content-type-switched pattern as port 80. TLS+H2
-# is exactly the condition under which XHTTP's mode=auto selects stream-up
-# and sends the gRPC-disguised frames, so this is the primary path.
+# Same per-transport-directive pattern as port 80, over TLS. TLS+H2 (ALPN
+# negotiates h2) is the well-verified condition under which XHTTP's
+# mode=auto selects stream-up and sends gRPC-disguised frames, so this is
+# the primary, best-supported path — see the FIX comment on port 80.
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
@@ -897,25 +938,20 @@ server {
     client_header_timeout 1d;
     keepalive_timeout     1d;
 
-    location = /${XHTTP_PATH#/} {
+    # XHTTP — same FIX as the port-80 block above: prefix match instead of
+    # exact match (Xray requests /${XHTTP_PATH}/<session-uuid>, never the
+    # bare path — see comment on the port-80 block for the verified
+    # source), and a single unconditional grpc_pass instead of the
+    # unverified content-type-switched if/proxy_pass hybrid.
+    location /${XHTTP_PATH#/}/ {
         client_max_body_size 0;
         client_body_buffer_size 512k;
         grpc_read_timeout 1d;
         grpc_send_timeout 1d;
-        proxy_read_timeout 1d;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        grpc_set_header Host \$host;
         grpc_set_header X-Real-IP \$remote_addr;
-        if (\$content_type ~* "grpc") {
-            grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
-            break;
-        }
-        proxy_pass http://127.0.0.1:${PORT_XHTTP_INNER};
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
     }
 
     location = /${UPGRADE_PATH#/} {
@@ -1033,7 +1069,7 @@ add_user() {
        "${CONFIG_FILE}" > "${TMP_CFG}"; then
         if jq empty "${TMP_CFG}" 2>/dev/null; then
             mv "${TMP_CFG}" "${CONFIG_FILE}"
-            msg_ok "User '${USERNAME}' added to all 4 inbounds (XHTTP x2 + Upgrade x2)."
+            msg_ok "User '${USERNAME}' added to both inbounds (XHTTP + Upgrade)." # FIX: was "all 4 inbounds" — config.json only ever had 2 (xhttp-inner, upgrade-inner); stale text from the old v4.0.0 per-port-inbound layout
         else
             msg_err "jq produced invalid JSON. Config unchanged."
             rm -f "${TMP_CFG}"; press_enter; return
@@ -1210,7 +1246,7 @@ view_client_config() {
 
     # ── [C] HTTP Upgrade CDN ──────────────────────────────────────────────────
     separator
-    echo -e "  ${GREEN}${BOLD}[C]  HTTP UPGRADE CDN MODE — Client:80 → CDN → nginx:80 → Xray${NC}"
+    echo -e "  ${GREEN}${BOLD}[C]  HTTP UPGRADE CDN MODE — Client:443 → CDN edge → nginx:443 → Xray${NC}"
     echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
     echo -e "  ${DIM}XHTTP is served on 443 ([A]/[B]) since TLS+H2 is what triggers its${NC}"
     echo -e "  ${DIM}gRPC-disguise mode — recommended over the rarely-needed port-80 path.${NC}"
