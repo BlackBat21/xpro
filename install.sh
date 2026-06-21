@@ -6,35 +6,40 @@
 #  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
 # /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 4.0.0
+# xray-xhttp-manager.sh  ·  Version 5.0.0
 # =============================================================================
 # Description : Automates the full lifecycle of Xray-core, fronted by nginx,
 #               using XHTTP and HTTP Upgrade transports — both on the
 #               standard ports 80 and 443 — on Ubuntu 24.04 LTS.
-#               · Port 80   — nginx, HTTP Upgrade only (NTLS / CDN origin)
-#               · Port 443  — nginx, XHTTP + HTTP Upgrade, both via TLS
+#               · Port 80   — nginx, real h2c listener: XHTTP + HTTP Upgrade
+#               · Port 443  — nginx, TLS: XHTTP + HTTP Upgrade
 #               · Xray itself never binds 80 or 443. It listens on two
 #                 internal loopback-only ports; nginx is the only public
-#                 listener and routes by path to the right Xray inbound.
+#                 listener.
 #               · Protocol : VLESS (zero-overhead, CDN-friendly)
 #               · CDN      : Cloudflare and compatible providers
-#               · Why nginx in front: VLESS's own path-based fallback
-#                 mechanism cannot parse HTTP/2 or XHTTP framing — only
-#                 plaintext HTTP/1.1 request lines — so trying to share
-#                 80/443 between two transports with Xray alone is
-#                 fundamentally unreliable. nginx is a real HTTP server;
-#                 its location path-matching works regardless of HTTP
-#                 version or transport framing.
-#               · Why XHTTP needs its own TLS-only port: XHTTP behind
-#                 nginx must use grpc_pass (not proxy_pass) because its
-#                 framing is HTTP/2 stream-based; proxy_pass is built for
-#                 buffered HTTP/1.1 request/response and breaks it. nginx
-#                 can only negotiate HTTP/2 safely per-connection via TLS
-#                 ALPN — there is no cleartext (h2c) mode that can safely
-#                 coexist with plain HTTP/1.1 in the same nginx server
-#                 block, which port 80 also needs for the Upgrade
-#                 handshake and static decoy content. So: XHTTP → 443
-#                 only; HTTP Upgrade → both 80 and 443.
+#
+# Architecture (v5.0.0, reverse-engineered from a real, actively-maintained
+# production deployment script rather than designed from scratch):
+#   Reference: github.com/GFW4Fun/x-ui-pro (x-ui-pro.sh) — an actively
+#   maintained, GitHub-signed-commit script that fronts Xray with nginx for
+#   exactly this transport mix (WS/gRPC/HttpUpgrade/XHTTP), at production
+#   scale. Its core pattern, adopted here:
+#     - ONE location per path. Inside it, nginx inspects the live request's
+#       Content-Type and dispatches to grpc_pass when it matches gRPC,
+#       falling through to proxy_pass (with Upgrade headers) otherwise.
+#       There is no separate "XHTTP path" vs "Upgrade path" routing split —
+#       both transport types can use the same location if needed; here they
+#       still get distinct paths for clarity, but the dispatch logic inside
+#       each XHTTP location is the proven content-type switch, not a
+#       hardcoded grpc_pass-only call.
+#     - listen 80 http2; IS a real, valid, commonly-used nginx directive
+#       (confirmed in XTLS/Xray-core discussion #3731's working config, and
+#       in the "Coexisting Vision+Reality" production tutorial). h2c
+#       cleartext on port 80 does NOT conflict with serving plain HTTP/1.1
+#       in the same block — earlier versions of this script wrongly assumed
+#       it did and split XHTTP onto TLS-only as a result. Both ports now
+#       run identically.
 #
 # Patch notes :
 #   v2.1.0 — All read -rp replaced with echo + read -r (Android SSH fix)
@@ -53,23 +58,31 @@
 #             desyncs path values during any future edit.
 #   v4.0.0 — Replaced dedicated ports (8880/8443) with nginx as a real
 #             reverse proxy in front of Xray, restoring 80/443 as the only
-#             public ports as originally requested. Xray's XHTTP and HTTP
-#             Upgrade inbounds moved to internal loopback ports with no
-#             "path" set (nginx now owns path validation — setting path on
-#             both layers is a documented conflict that silently breaks
-#             responses: github.com/XTLS/Xray-core/discussions/5822).
-#             XHTTP uses grpc_pass per Xray's own official nginx reference
-#             (github.com/XTLS/Xray-examples, VLESS-XHTTP3-Nginx) since
-#             proxy_pass cannot relay XHTTP's HTTP/2 stream framing.
-#             Client mode set to packet-up, the officially documented
-#             "maximum compatibility behind a reverse proxy / CDN" mode.
-#             IMPORTANT CONSTRAINT discovered during this build: XHTTP via
-#             grpc_pass requires HTTP/2, and nginx can only negotiate HTTP/2
-#             safely on a per-connection basis through TLS ALPN — there is
-#             no cleartext equivalent that coexists with plain HTTP/1.1 in
-#             the same server block. So XHTTP is TLS-only (port 443); HTTP
-#             Upgrade, being genuine HTTP/1.1 Connection:Upgrade, works
-#             cleartext and is available on both 80 and 443.
+#             public ports. Xray's XHTTP and HTTP Upgrade inbounds moved to
+#             internal loopback ports with no "path" set (nginx now owns
+#             path validation — setting path on both layers is a documented
+#             conflict: github.com/XTLS/Xray-core/discussions/5822). Used
+#             grpc_pass unconditionally for XHTTP with client mode=packet-up.
+#             STILL BROKEN: packet-up never sends a gRPC Content-Type — it's
+#             plain chunked HTTP/1.1 — so pairing it with an nginx config
+#             built entirely around grpc_pass was an internal mismatch.
+#             grpc_pass expects real gRPC framing and either mangles or
+#             rejects packet-up's plain HTTP. This was never caught because
+#             every prior test only validated nginx's *listener* (ss -tlnp,
+#             nginx -t), never the actual mode/directive pairing.
+#   v5.0.0 — Reverse-engineered from GFW4Fun/x-ui-pro, a real production
+#             script solving this exact problem. Two fixes: (1) client AND
+#             server XHTTP mode changed from packet-up to auto — auto
+#             negotiates to stream-up under TLS+H2, and stream-up
+#             deliberately disguises its frames with a gRPC Content-Type
+#             specifically so reverse proxies and CDNs route it correctly
+#             (confirmed: XTLS/Xray-core discussion #4113). (2) nginx now
+#             inspects $content_type at request time and dispatches to
+#             grpc_pass only when it actually matches gRPC, instead of
+#             calling grpc_pass unconditionally on every request to that
+#             path. Port 80 now also runs XHTTP (real h2c, not a workaround)
+#             since the earlier "h2c can't coexist with HTTP/1.1" assumption
+#             was incorrect — both ports are now structurally identical.
 #
 # Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
 # Usage       : sudo bash xray-xhttp-manager.sh
@@ -220,9 +233,9 @@ print_banner() {
     echo "  ║                                                                  ║"
     echo "  ║       X R A Y - C O R E   ·   X H T T P   M A N A G E R        ║"
     echo "  ║                                                                  ║"
-    echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade           v4.0.0     ║"
-    echo "  ║   Front-end : nginx (TLS-terminating, path-based router)        ║"
-    echo "  ║   Port 80   : nginx → HTTP Upgrade  (NTLS / CDN origin)         ║"
+    echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade           v5.0.0     ║"
+    echo "  ║   Front-end : nginx (content-type-switched router)              ║"
+    echo "  ║   Port 80   : nginx → XHTTP + HTTP Upgrade  (h2c)               ║"
     echo "  ║   Port 443  : nginx → XHTTP + HTTP Upgrade  (TLS, LE cert)      ║"
     echo "  ║   CDN       : Cloudflare / CloudFront / Fastly compatible       ║"
     echo "  ║   OS        : Ubuntu 24.04 LTS                                  ║"
@@ -610,7 +623,7 @@ install_xray() {
         "network": "xhttp",
         "security": "none",
         "xhttpSettings": {
-          "mode": "packet-up",
+          "mode": "auto",
           "extra": {
             "scMaxEachPostBytes": 1000000,
             "scMinPostsIntervalMs": 30,
@@ -748,8 +761,8 @@ SYSTEMD_EOF
 
     if cmd_exists ufw; then
         ufw allow OpenSSH                                  >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 80/tcp  comment 'nginx — HTTP Upgrade NTLS/CDN'  >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 443/tcp comment 'nginx — XHTTP/Upgrade TLS'      >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 80/tcp  comment 'nginx — XHTTP+Upgrade NTLS/CDN' >>"${INSTALL_LOG}" 2>&1 || true
+        ufw allow 443/tcp comment 'nginx — XHTTP+Upgrade TLS'      >>"${INSTALL_LOG}" 2>&1 || true
         msg_ok "UFW: ports 22, 80 and 443 opened. Inner Xray ports stay loopback-only."
     else
         msg_warn "UFW not found. Open ports 80/443 in your cloud security group manually."
@@ -758,26 +771,34 @@ SYSTEMD_EOF
     # ── Step 10: nginx reverse proxy (path-based router for both transports) ───
     msg_step "Step 10/10 — Configuring nginx as the public-facing router"
     #
-    # nginx owns ports 80 and 443. It terminates TLS itself (Let's Encrypt
-    # cert from Step 6) and splits incoming requests by path:
-    #   /${XHTTP_PATH}    → grpc_pass  → 127.0.0.1:${PORT_XHTTP_INNER}
-    #   /${UPGRADE_PATH}  → proxy_pass → 127.0.0.1:${PORT_UPGRADE_INNER}
+    # nginx owns ports 80 and 443. It terminates TLS itself on 443 (Let's
+    # Encrypt cert from Step 6) and is a real h2/h2c server on both ports —
+    # listen 80 http2 and listen 443 ssl http2 both work on nginx 1.18+.
     #
-    # grpc_pass is required for XHTTP, not proxy_pass — XHTTP's mode:packet-up
-    # speaks HTTP/2 stream framing, and nginx's proxy_pass (built for buffered
-    # HTTP/1.1 request/response) cannot relay that correctly: it produces
-    # "upstream prematurely closed connection" errors and silent client-side
-    # hangs. grpc_pass natively understands HTTP/2 framing and passes it
-    # through cleanly. This matches Xray's own official reference config:
-    # github.com/XTLS/Xray-examples/blob/main/VLESS-XHTTP3-Nginx/nginx.conf
+    # Architecture verified against a real, actively-maintained production
+    # script (GFW4Fun/x-ui-pro, github.com/GFW4Fun/x-ui-pro) and Xray's own
+    # official examples (XTLS/Xray-examples, VLESS-GRPC and VLESS-XHTTP3-Nginx)
+    # rather than designed from scratch. Both use ONE location per path that
+    # inspects the request's Content-Type at runtime and dispatches to either
+    # grpc_pass or proxy_pass from inside the SAME block — not two separate
+    # paths/ports for two transports.
     #
-    # HTTP Upgrade is the opposite: it really is an HTTP/1.1 `Connection:
-    # Upgrade` handshake (the same mechanism WebSocket uses), so it needs
-    # proxy_pass with explicit Upgrade/Connection headers, not grpc_pass.
+    # XHTTP server mode is "auto", which negotiates to stream-up over TLS+H2.
+    # stream-up deliberately disguises its frames with a gRPC-style header
+    # specifically so it passes through nginx's grpc_pass and Cloudflare's
+    # gRPC feature (confirmed: XTLS/Xray-core discussion #4113). This was
+    # the actual bug in the previous version of this script: it paired
+    # mode=packet-up (plain chunked HTTP/1.1, never sends a gRPC content
+    # type) with an nginx config built entirely around grpc_pass — a
+    # mismatch that produces exactly the silent failures seen throughout
+    # testing. Content-Type detection only works when the client's mode
+    # is auto or stream-up; packet-up content reaching grpc_pass is
+    # malformed gRPC and is rejected or hangs.
     #
-    # Any request to an unrecognized path returns 404, exactly mirroring
-    # the "must return 400/404, never 502" sanity check the Xray community
-    # uses to confirm nginx + Xray are wired correctly.
+    # HTTP Upgrade is a real HTTP/1.1 `Connection: Upgrade` handshake (same
+    # mechanism as WebSocket) and always uses proxy_pass — it never sends
+    # a gRPC content type, so it always falls through to the proxy_pass
+    # branch in the same location block.
 
     mkdir -p /var/www/html
     if [[ ! -f /var/www/html/index.html ]]; then
@@ -791,27 +812,51 @@ HTML_EOF
     rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 
     cat > /etc/nginx/sites-available/xray-router << NGINX_EOF
-# ── Port 80 — HTTP Upgrade only (NTLS / CDN origin) ────────────────────────
-# XHTTP is NOT served here. grpc_pass requires HTTP/2, and nginx negotiates
-# HTTP/2 per-listener via TLS ALPN — there is no equivalent safe negotiation
-# on a cleartext port that can coexist with plain HTTP/1.1 in the same
-# server block. Forcing h2c cleartext on port 80 would break the plain
-# HTTP/1.1 Upgrade handshake and static-file serving in this same block.
-# This matches Xray's own official nginx reference, which only ever uses
-# grpc_pass on the TLS-terminated, http2-negotiated server block.
+# ── Port 80 — NTLS / CDN origin ─────────────────────────────────────────────
+# Real h2c (cleartext HTTP/2) listener — this is a standard, documented nginx
+# capability (confirmed via XTLS/Xray-core discussion #3731's working nginx
+# config: "listen 80 http2 ...; listen 443 ssl http2 ...;" serving both ports
+# identically). XHTTP's stream-up frames disguise themselves as gRPC traffic
+# specifically so reverse proxies route them correctly without special cases.
 server {
-    listen 80;
-    listen [::]:80;
+    listen 80 http2;
+    listen [::]:80 http2;
     server_name ${DOMAIN};
 
     root /var/www/html;
     index index.html;
 
     client_max_body_size 0;
-    client_body_timeout   5m;
-    client_header_timeout 5m;
-    keepalive_timeout     5m;
+    client_body_timeout   1d;
+    client_header_timeout 1d;
+    keepalive_timeout     1d;
 
+    # XHTTP — one location, dispatches by Content-Type at request time.
+    # mode=auto on both client and server negotiates to stream-up, which
+    # sends a gRPC-style Content-Type specifically so this check succeeds.
+    location = /${XHTTP_PATH#/} {
+        client_max_body_size 0;
+        client_body_buffer_size 512k;
+        grpc_read_timeout 1d;
+        grpc_send_timeout 1d;
+        proxy_read_timeout 1d;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Real-IP \$remote_addr;
+        if (\$content_type ~* "grpc") {
+            grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
+            break;
+        }
+        proxy_pass http://127.0.0.1:${PORT_XHTTP_INNER};
+    }
+
+    # HTTP Upgrade — always a real HTTP/1.1 Connection:Upgrade handshake,
+    # never gRPC, so this is plain proxy_pass with Upgrade headers.
     location = /${UPGRADE_PATH#/} {
         if (\$http_upgrade != "websocket") { return 404; }
         proxy_http_version 1.1;
@@ -820,7 +865,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 86400;
+        proxy_read_timeout 1d;
         proxy_redirect off;
         proxy_pass http://127.0.0.1:${PORT_UPGRADE_INNER};
     }
@@ -831,14 +876,12 @@ server {
 }
 
 # ── Port 443 — TLS direct (Let's Encrypt cert, no CDN in front) ────────────
-# Both transports live here. TLS lets nginx negotiate HTTP/2 via ALPN
-# automatically per-connection — h2 clients (XHTTP/grpc_pass) and HTTP/1.1
-# clients (the Upgrade handshake) are routed correctly without conflict,
-# which is impossible to do safely on a cleartext listener.
+# Same single-location, content-type-switched pattern as port 80. TLS+H2
+# is exactly the condition under which XHTTP's mode=auto selects stream-up
+# and sends the gRPC-disguised frames, so this is the primary path.
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate     ${CERT_FULLCHAIN};
@@ -850,21 +893,29 @@ server {
     index index.html;
 
     client_max_body_size 0;
-    client_body_timeout   5m;
-    client_header_timeout 5m;
-    keepalive_timeout     5m;
+    client_body_timeout   1d;
+    client_header_timeout 1d;
+    keepalive_timeout     1d;
 
     location = /${XHTTP_PATH#/} {
-        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
-        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        grpc_read_timeout 315;
-        grpc_send_timeout 5m;
-    }
-    location /${XHTTP_PATH#/}/ {
-        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
-        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        grpc_read_timeout 315;
-        grpc_send_timeout 5m;
+        client_max_body_size 0;
+        client_body_buffer_size 512k;
+        grpc_read_timeout 1d;
+        grpc_send_timeout 1d;
+        proxy_read_timeout 1d;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Real-IP \$remote_addr;
+        if (\$content_type ~* "grpc") {
+            grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
+            break;
+        }
+        proxy_pass http://127.0.0.1:${PORT_XHTTP_INNER};
     }
 
     location = /${UPGRADE_PATH#/} {
@@ -875,7 +926,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 86400;
+        proxy_read_timeout 1d;
         proxy_redirect off;
         proxy_pass http://127.0.0.1:${PORT_UPGRADE_INNER};
     }
@@ -924,7 +975,7 @@ NGINX_EOF
     echo -e "  ${WHITE}Domain         :${NC} ${DOMAIN}"
     echo -e "  ${WHITE}XHTTP path     :${NC} ${XHTTP_PATH}"
     echo -e "  ${WHITE}Upgrade path   :${NC} ${UPGRADE_PATH}"
-    echo -e "  ${WHITE}Port 80        :${NC} nginx — HTTP Upgrade only, NTLS (CDN-friendly)"
+    echo -e "  ${WHITE}Port 80        :${NC} nginx — XHTTP + HTTP Upgrade, h2c (CDN-friendly)"
     echo -e "  ${WHITE}Port 443       :${NC} nginx — XHTTP + HTTP Upgrade, TLS (Let's Encrypt cert)"
     echo -e "  ${WHITE}Internal ports :${NC} ${PORT_XHTTP_INNER} (XHTTP) / ${PORT_UPGRADE_INNER} (Upgrade) — loopback only"
     echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
@@ -1072,12 +1123,12 @@ view_client_config() {
     PATH_ENC="$(urlencode "${XHTTP_PATH}")"
 
     # [A] XHTTP CDN Mode — client:443 (or CDN edge) → nginx:443 → grpc_pass → xhttp-inner
-    # mode=packet-up is the most CDN/reverse-proxy-compatible XHTTP mode
-    # (official guidance: "if it can't get through other CDNs or proxy
-    # software, set mode to packet-up — strongest compatibility").
+    # mode=auto matches the server config: over TLS+H2 it negotiates to
+    # stream-up, which disguises frames with a gRPC Content-Type specifically
+    # so nginx's grpc_pass (and Cloudflare's gRPC feature) handle it correctly.
     local CDN_URL
     CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    CDN_URL+="?encryption=none&type=xhttp&mode=packet-up"
+    CDN_URL+="?encryption=none&type=xhttp&mode=auto"
     CDN_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
     CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2"
     CDN_URL+="#${SELECTED_USER}-XHTTP-CDN"
@@ -1085,7 +1136,7 @@ view_client_config() {
     # [B] XHTTP Direct TLS — client connects straight to nginx:443 (no CDN)
     local DIRECT_URL
     DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    DIRECT_URL+="?encryption=none&type=xhttp&mode=packet-up"
+    DIRECT_URL+="?encryption=none&type=xhttp&mode=auto"
     DIRECT_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
     DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2"
     DIRECT_URL+="#${SELECTED_USER}-XHTTP-Direct-TLS"
@@ -1161,7 +1212,8 @@ view_client_config() {
     separator
     echo -e "  ${GREEN}${BOLD}[C]  HTTP UPGRADE CDN MODE — Client:80 → CDN → nginx:80 → Xray${NC}"
     echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
-    echo -e "  ${DIM}Port 80 is HTTP Upgrade's home — XHTTP requires TLS, see [A]/[B] above.${NC}"
+    echo -e "  ${DIM}XHTTP is served on 443 ([A]/[B]) since TLS+H2 is what triggers its${NC}"
+    echo -e "  ${DIM}gRPC-disguise mode — recommended over the rarely-needed port-80 path.${NC}"
     echo ""
     echo -e "  ${WHITE}VLESS URL:${NC}"
     echo -e "  ${CYAN}${UPGRADE_CDN_URL}${NC}"
@@ -1239,10 +1291,10 @@ check_status() {
 
     echo -e "  ${WHITE}${BOLD}Public (nginx):${NC}"
     if [[ -n "${P80_INFO}" ]]; then
-        echo -e "  Port 80   (nginx, HTTP Upgrade NTLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
+        echo -e "  Port 80   (nginx, XHTTP+Upgrade h2c)  : ${GREEN}${BOLD}● LISTENING${NC}"
         echo -e "  ${DIM}  ${P80_INFO}${NC}"
     else
-        echo -e "  Port 80   (nginx, HTTP Upgrade NTLS)  : ${RED}○ NOT LISTENING${NC}"
+        echo -e "  Port 80   (nginx, XHTTP+Upgrade h2c)  : ${RED}○ NOT LISTENING${NC}"
     fi
 
     if [[ -n "${P443_INFO}" ]]; then
