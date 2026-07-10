@@ -500,7 +500,12 @@ generate_reality_keys() {
     private_key="$(echo "${raw}" | grep -iE '^Private ?Key:' | head -n1 | cut -d: -f2 | tr -d ' \r')"
     public_key="$(echo "${raw}" | grep -iE '^Public ?Key:' | head -n1 | cut -d: -f2 | tr -d ' \r')"
     if [[ -z "${public_key}" ]]; then
-        public_key="$(echo "${raw}" | grep -iE '^Password:' | head -n1 | cut -d: -f2 | tr -d ' \r')"
+        # Match "Password:" and also "Password (PublicKey):" — some current
+        # Xray-core builds (confirmed on v26.3.27) add a parenthetical
+        # clarification before the colon. Anchoring on "Password" without
+        # requiring the colon immediately after it, and relying on
+        # cut -d: -f2 to grab everything past the FIRST colon, handles both.
+        public_key="$(echo "${raw}" | grep -iE '^Password' | head -n1 | cut -d: -f2 | tr -d ' \r')"
     fi
 
     if [[ -z "${private_key}" || -z "${public_key}" ]]; then
