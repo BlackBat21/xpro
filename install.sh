@@ -1,1617 +1,1590 @@
 #!/usr/bin/env bash
-# =============================================================================
-#  __  __  ____      _     __  __  _   _ _____ _____  _____
-# \ \/ /|  _ \    / \    \ \/ / | | | |_   _|_   _||  __ \
-#  \  / | |_) |  / _ \    \  /  | |_| |  | |   | |  | |__) |
-#  /  \ |  _ <  / ___ \   /  \  |  _  |  | |   | |  |  ___/
-# /_/\_\|_| \_\/_/   \_\ /_/\_\ |_| |_| _|_|_  |_|  |_|
 #
-# xray-xhttp-manager.sh  ·  Version 5.0.0
-# =============================================================================
-# Description : Automates the full lifecycle of Xray-core, fronted by nginx,
-#               using XHTTP and HTTP Upgrade transports — both on the
-#               standard ports 80 and 443 — on Ubuntu 24.04 LTS.
-#               · Port 80   — nginx, plain HTTP/1.1: HTTP Upgrade only
-#               · Port 443  — nginx, TLS: XHTTP + HTTP Upgrade
-#               · Xray itself never binds 80 or 443. It listens on two
-#                 internal loopback-only ports; nginx is the only public
-#                 listener.
-#               · Protocol : VLESS (zero-overhead, CDN-friendly)
-#               · CDN      : Cloudflare and compatible providers
+# xpro.sh — VLESS + XTLS-Vision + REALITY manager for Xray-core
 #
-# Architecture (audited and corrected — see patch notes v5.0.1/v5.0.2 below
-# for what changed and why; each fix cites its verification source):
-#   Reference: github.com/GFW4Fun/x-ui-pro (x-ui-pro.sh) is a real repo with
-#   a similar transport mix, but its internal nginx template was NOT
-#   independently verified during this audit — treat the "ONE location,
-#   content-type dispatch" idea below as historical context, not as a
-#   currently-accurate description (see v5.0.1).
-#     - listen 80 http2; IS valid nginx syntax, but on a cleartext (non-TLS)
-#       socket it makes that socket HTTP/2-ONLY with no fallback to
-#       HTTP/1.1 on nginx versions before 1.25.1 — and Ubuntu 24.04's
-#       stock `apt install nginx` is 1.24.0. This was DISPROVEN by a live
-#       deployment (curl against port 80 got "Received HTTP/0.9 when not
-#       allowed") and confirmed against nginx's own bug tracker — see the
-#       FIX comment on the port-80 server block, v5.0.1 below.
+#   Repo (placeholder — replace with your real fork before using "Update Script"):
+#     https://github.com/BlackBat21/xpro
 #
-# Patch notes :
-#   v2.1.0 — All read -rp replaced with echo + read -r (Android SSH fix)
-#   v2.2.0 — exec 0</dev/tty + TERM export in main() (Android PTY fix)
-#   v2.3.0 — geoip.dat/geosite.dat: create /usr/local/share/xray/ first,
-#             download geo files there, add XRAY_LOCATION_ASSET env to
-#             systemd service. Eliminates "no such file" crash on start.
-#   v3.0.0 — HTTP Upgrade added on its OWN dedicated ports (8880/8443)
-#             instead of sharing 80/443 with XHTTP via TCP fallback routing.
-#             An earlier fallback-sharing design (v2.5.0–v2.7.0, never
-#             released) tried to multiplex both transports onto 80/443 using
-#             VLESS path-based fallbacks. That approach broke repeatedly:
-#             fallbacks can't parse HTTP/2 frames (h2 ALPN caused silent
-#             disconnects), require a catch-all entry or every unmatched
-#             connection is dropped, and add an inner/outer split that
-#             desyncs path values during any future edit.
-#   v4.0.0 — Replaced dedicated ports (8880/8443) with nginx as a real
-#             reverse proxy in front of Xray, restoring 80/443 as the only
-#             public ports. Xray's XHTTP and HTTP Upgrade inbounds moved to
-#             internal loopback ports with no "path" set (nginx now owns
-#             path validation — setting path on both layers is a documented
-#             conflict: github.com/XTLS/Xray-core/discussions/5822). Used
-#             grpc_pass unconditionally for XHTTP with client mode=packet-up.
-#             STILL BROKEN: packet-up never sends a gRPC Content-Type — it's
-#             plain chunked HTTP/1.1 — so pairing it with an nginx config
-#             built entirely around grpc_pass was an internal mismatch.
-#             grpc_pass expects real gRPC framing and either mangles or
-#             rejects packet-up's plain HTTP. This was never caught because
-#             every prior test only validated nginx's *listener* (ss -tlnp,
-#             nginx -t), never the actual mode/directive pairing.
-#   v5.0.0 — Reverse-engineered from GFW4Fun/x-ui-pro, a real production
-#             script solving this exact problem. Two fixes: (1) client AND
-#             server XHTTP mode changed from packet-up to auto — auto
-#             negotiates to stream-up under TLS+H2, and stream-up
-#             deliberately disguises its frames with a gRPC Content-Type
-#             specifically so reverse proxies and CDNs route it correctly
-#             (confirmed: XTLS/Xray-core discussion #4113). (2) nginx now
-#             inspects $content_type at request time and dispatches to
-#             grpc_pass only when it actually matches gRPC, instead of
-#             calling grpc_pass unconditionally on every request to that
-#             path. Port 80 now also runs XHTTP (real h2c, not a workaround)
-#             since the earlier "h2c can't coexist with HTTP/1.1" assumption
-#             was incorrect — both ports are now structurally identical.
-#             CORRECTION (see v5.0.1): the "h2c can't coexist with HTTP/1.1"
-#             assumption this entry dismisses was actually correct for the
-#             nginx version this script installs. STILL BROKEN: see v5.0.1.
-#   v5.0.1 — STILL BROKEN, root-caused via a live deployment: every XHTTP
-#             request 404'd because the nginx location used an exact match
-#             ("location = /<path>") while Xray always requests sub-paths
-#             ("/<path>/<session-uuid>") — confirmed against a real nginx
-#             error log in XTLS/Xray-core discussion #5822. Changed to a
-#             prefix-match location on both ports, and replaced the
-#             unverified "if ($content_type ~* grpc) {grpc_pass} proxy_pass"
-#             dispatch with a single unconditional grpc_pass, matching the
-#             official XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf
-#             template and RPRX's own troubleshooting guidance in
-#             discussion #4113.
-#   v5.0.2 — STILL BROKEN on port 80 specifically, root-caused via a live
-#             curl test against the v5.0.1 build: `curl -iv http://<domain>/`
-#             returned "Received HTTP/0.9 when not allowed" — the exact
-#             symptom of an HTTP/1.1 request hitting an h2c-only nginx
-#             socket. The v5.0.0 architecture note's claim that "h2c does
-#             NOT conflict with serving plain HTTP/1.1 in the same block"
-#             was false for nginx 1.24.0 (Ubuntu 24.04's stock package);
-#             nginx didn't add same-socket h2c+HTTP/1.1 support until
-#             1.25.1 (confirmed: trac.nginx.org/nginx/ticket/816, "HTTP/1.1
-#             clients will fail on the socket, preventing the use of HTTP
-#             Upgrade" — closed/fixed in 1.25.1). This meant HTTP Upgrade
-#             on port 80 could never have worked, XHTTP on port 80 only had
-#             a chance if the client did real HTTP/2-prior-knowledge
-#             dialing (most don't by default), and the only consistently
-#             working path was port 443. Fix: port 80 is now plain
-#             HTTP/1.1 ("listen 80;", no http2 param) serving HTTP Upgrade
-#             only; XHTTP is TLS-only (port 443), where ALPN correctly
-#             negotiates h2 vs HTTP/1.1 on the same socket regardless of
-#             nginx version.
+#   Upstream Xray-core:
+#     https://github.com/xtls/xray-core
 #
-# Requirements: Ubuntu 24.04 LTS · Root access · Resolvable domain name
-# Usage       : sudo bash xray-xhttp-manager.sh
-# =============================================================================
+# WHAT THIS SCRIPT DOES
+#   - Installs Xray-core from the official GitHub Releases API onto Ubuntu 24.04.
+#   - Builds a single VLESS/XTLS-Vision/REALITY inbound on port 443.
+#   - Manages "accounts" (Xray clients) with expiry dates tracked OUTSIDE the
+#     Xray config, in a small local JSON database.
+#   - Provides a dialog/whiptail TUI menu for create/delete/extend/list/update/
+#     uninstall, plus a daily systemd timer that sweeps expired accounts.
+#
+# DESIGN NOTES
+#   - Xray's config.json has no concept of "expiry" — it only knows about
+#     clients that are either present or absent. Expiry is therefore modeled
+#     as "does this user still exist in the config", and the source of truth
+#     for *when* that should happen lives in our own DB file, never in the
+#     Xray config itself. That satisfies requirement #2 in the spec and also
+#     means a corrupt/rebuilt Xray config can never leak a stale expiry date.
+#   - Every mutation of config.json goes through a read -> jq transform ->
+#     validate -> atomically move into place pipeline, so a crash mid-write
+#     can never leave Xray with a half-written (unparseable) config.
+#   - jq is required, not optional, for anything that touches config.json.
+#     No sed/awk/string-concat JSON generation, anywhere.
+#
+set -uo pipefail
+# NOTE: we deliberately do NOT run this whole script under `set -e`.
+# An interactive TUI needs to survive a failed sub-command (a bad jq filter,
+# a user hitting Cancel, curl timing out) and return to the menu instead of
+# dying. Instead, every function that performs a multi-step mutation checks
+# each step's exit code explicitly and calls die()/warn() as appropriate.
+# Where we DO want "abort this function on first error" semantics, we wrap
+# the block in a subshell that itself uses `set -e` (see with_strict()).
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 1  ANSI COLOR CODES
-# ─────────────────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-WHITE='\033[1;37m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# ---------------------------------------------------------------------------
+# Global paths & constants
+# ---------------------------------------------------------------------------
+readonly XPRO_VERSION="1.0.0"
+readonly XPRO_REPO="https://github.com/BlackBat21/xpro"                  # placeholder
+readonly XPRO_RAW_URL="https://raw.githubusercontent.com/BlackBat21/xpro/main/xpro.sh"  # placeholder
+_self_path="$(readlink -f "${BASH_SOURCE[0]}")"
+readonly XPRO_SELF_PATH="${_self_path}"
+unset _self_path
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 2  GLOBAL CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
-XRAY_BIN="/usr/local/bin/xray"
-XRAY_CONFIG_DIR="/usr/local/etc/xray"
-CONFIG_FILE="${XRAY_CONFIG_DIR}/config.json"
-LOG_DIR="/var/log/xray"
-SERVICE_FILE="/etc/systemd/system/xray.service"
+readonly XRAY_BIN_DIR="/usr/local/bin"
+readonly XRAY_BIN="${XRAY_BIN_DIR}/xray"
+readonly XRAY_ETC_DIR="/usr/local/etc/xray"
+readonly XRAY_CONFIG="${XRAY_ETC_DIR}/config.json"
+readonly XRAY_LOG_DIR="/var/log/xray"
+readonly XRAY_SYSTEMD_UNIT="/etc/systemd/system/xray.service"
+readonly XRAY_RELEASES_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 
-# v2.3.0 — Dedicated geo-data directory. Xray is told about this via the
-# XRAY_LOCATION_ASSET environment variable in the systemd unit file.
-# This is the ONLY place Xray will look for geoip.dat and geosite.dat.
-GEO_DIR="/usr/local/share/xray"
+readonly XPRO_HOME="/etc/xray-manager"
+readonly XPRO_DB="${XPRO_HOME}/db.json"
+readonly XPRO_KEYS="${XPRO_HOME}/reality_keys.json"
+readonly XPRO_LOG="${XPRO_HOME}/xpro.log"
+readonly XPRO_BACKUP_DIR="${XPRO_HOME}/backups"
 
-DOMAIN_FILE="${XRAY_CONFIG_DIR}/.domain"
-PATH_FILE="${XRAY_CONFIG_DIR}/.xhttp_path"
-UPGRADE_PATH_FILE="${XRAY_CONFIG_DIR}/.upgrade_path"
+readonly XPRO_SWEEP_SCRIPT="${XPRO_HOME}/expiry-sweep.sh"
+readonly XPRO_SYSTEMD_SERVICE="/etc/systemd/system/xpro-sweep.service"
+readonly XPRO_SYSTEMD_TIMER="/etc/systemd/system/xpro-sweep.timer"
+readonly XPRO_CRON_FALLBACK="/etc/cron.d/xpro-sweep"   # used only if systemd timers are unavailable
 
-CERT_DIR="/etc/ssl/xray"
-CERT_FULLCHAIN="${CERT_DIR}/fullchain.pem"
-CERT_KEY="${CERT_DIR}/privkey.pem"
+readonly XPRO_INSTALLED_PATH="/usr/local/bin/xpro"     # where we install ourselves for `xpro` shorthand
 
-ACME_HOME="/root/.acme.sh"
-ACME_BIN="${ACME_HOME}/acme.sh"
+# Default REALITY camouflage target. Overridable at install time via the TUI.
+# (dest is always derived as "${sni}:443" at install time, so only the SNI
+# and port need a default here — see run_installer.)
+DEFAULT_SNI="www.microsoft.com"
+DEFAULT_PORT="443"
 
-PORT_TLS=443
-PORT_NTLS=80
-# Internal-only loopback ports — never exposed publicly. nginx terminates
-# TLS and does path-based routing on 80/443, then hands off plaintext
-# HTTP/2 (XHTTP) or HTTP/1.1 Upgrade (HTTP Upgrade) to these loopback ports.
-PORT_XHTTP_INNER=20080
-PORT_UPGRADE_INNER=20081
+# ---------------------------------------------------------------------------
+# Colors (plain ANSI, degrade gracefully if not a tty)
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    _c_red="$(tput setaf 1 2>/dev/null || true)"
+    _c_green="$(tput setaf 2 2>/dev/null || true)"
+    _c_yellow="$(tput setaf 3 2>/dev/null || true)"
+    _c_blue="$(tput setaf 4 2>/dev/null || true)"
+    _c_bold="$(tput bold 2>/dev/null || true)"
+    _c_reset="$(tput sgr0 2>/dev/null || true)"
+else
+    _c_red="" _c_green="" _c_yellow="" _c_blue="" _c_bold="" _c_reset=""
+fi
+readonly C_RED="${_c_red}" C_GREEN="${_c_green}" C_YELLOW="${_c_yellow}"
+readonly C_BLUE="${_c_blue}" C_BOLD="${_c_bold}" C_RESET="${_c_reset}"
+unset _c_red _c_green _c_yellow _c_blue _c_bold _c_reset
 
-XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-XRAY_DL_BASE="https://github.com/XTLS/Xray-core/releases/download"
-
-# Fallback geo-data download URLs (Loyalsoldier builds are more up-to-date)
-GEOIP_URL_PRIMARY="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
-GEOIP_URL_FALLBACK="https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
-GEOSITE_URL_PRIMARY="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
-GEOSITE_URL_FALLBACK="https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
-
-INSTALL_LOG="/var/log/xray_install.log"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# § 3  HELPER / UTILITY FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-
-separator() {
-    echo -e "${BLUE}  ──────────────────────────────────────────────────────────────  ${NC}"
+# ---------------------------------------------------------------------------
+# Logging helpers — everything goes to stderr AND the persistent log file,
+# so the TUI's stdout stays clean for dialog/whiptail widgets.
+# ---------------------------------------------------------------------------
+_log_line() {
+    # $1=level $2=message
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '[%s] [%s] %s\n' "$ts" "$1" "$2" >>"${XPRO_LOG}" 2>/dev/null || true
 }
 
-msg_info() { echo -e "${YELLOW}  [INFO]  ${NC}${1}"; }
-msg_ok()   { echo -e "${GREEN}  [OK]    ${NC}${1}"; }
-msg_warn() { echo -e "${YELLOW}  [WARN]  ${NC}${1}"; }
+info()  { echo -e "${C_BLUE}[INFO]${C_RESET} $*" >&2;  _log_line "INFO"  "$*"; }
+ok()    { echo -e "${C_GREEN}[ OK ]${C_RESET} $*" >&2; _log_line "OK"    "$*"; }
+warn()  { echo -e "${C_YELLOW}[WARN]${C_RESET} $*" >&2; _log_line "WARN" "$*"; }
+err()   { echo -e "${C_RED}[FAIL]${C_RESET} $*" >&2;   _log_line "ERROR" "$*"; }
 
-msg_err() {
-    echo -e "${RED}  [ERROR] ${NC}${1}" >&2
-    if [[ "${2:-}" == "exit" ]]; then
-        echo -e "${RED}  Script aborted. Details logged to: ${INSTALL_LOG}${NC}" >&2
-        exit 1
-    fi
+die() {
+    err "$*"
+    exit 1
 }
 
-msg_step() {
-    echo ""
-    echo -e "${CYAN}${BOLD}  ▶  ${1}${NC}"
-    echo ""
+# Run a block with strict error handling and return its exit code instead of
+# killing the whole interactive process. Usage: with_strict '<commands>'
+with_strict() {
+    (
+        set -e
+        eval "$1"
+    )
 }
 
-cmd_exists() { command -v "$1" &>/dev/null; }
-
-is_xray_installed() {
-    [[ -f "${XRAY_BIN}" ]] && [[ -f "${CONFIG_FILE}" ]]
+pause() {
+    # Give the operator a chance to read output before we redraw a dialog menu.
+    read -rp "$(echo -e "${C_BOLD}Press Enter to continue...${C_RESET}")" _ </dev/tty || true
 }
 
-is_port_in_use() {
-    ss -tln 2>/dev/null | grep -q ":${1} "
-}
-
-# press_enter — echo then plain read -r < /dev/tty (Android SSH compatible)
-press_enter() {
-    echo ""
-    echo -e "  ${YELLOW}Press Enter to return to the main menu...${NC}"
-    read -r _DUMMY < /dev/tty
-}
-
-urlencode() {
-    python3 -c \
-        "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read().strip()))" \
-        <<< "${1}"
-}
-
-# download_file PRIMARY_URL FALLBACK_URL DEST_PATH LABEL
-# Tries the primary URL first; falls back to the secondary on failure.
-# Exits the script if both fail — the file is non-negotiable.
-download_file() {
-    local primary="${1}" fallback="${2}" dest="${3}" label="${4}"
-    msg_info "Downloading ${label} (primary source)..."
-    if curl -fsSL --connect-timeout 20 -o "${dest}" "${primary}" 2>>"${INSTALL_LOG}"; then
-        local sz
-        sz=$(stat -c%s "${dest}" 2>/dev/null || echo 0)
-        if [[ "${sz}" -gt 1024 ]]; then
-            msg_ok "${label} downloaded ($(( sz / 1024 )) KB)."
-            return 0
-        fi
-    fi
-    msg_warn "Primary source failed. Trying fallback..."
-    if curl -fsSL --connect-timeout 20 -o "${dest}" "${fallback}" 2>>"${INSTALL_LOG}"; then
-        local sz
-        sz=$(stat -c%s "${dest}" 2>/dev/null || echo 0)
-        if [[ "${sz}" -gt 1024 ]]; then
-            msg_ok "${label} downloaded via fallback ($(( sz / 1024 )) KB)."
-            return 0
-        fi
-    fi
-    msg_err "Both download sources failed for ${label}." "exit"
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# § 4  MAIN BANNER
-# ─────────────────────────────────────────────────────────────────────────────
-
-print_banner() {
-    clear
-    echo ""
-    echo -e "${CYAN}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════════════════════════╗"
-    echo "  ║                                                                  ║"
-    echo "  ║       X R A Y - C O R E   ·   X H T T P   M A N A G E R        ║"
-    echo "  ║                                                                  ║"
-    echo "  ║   Transport : VLESS + XHTTP / HTTP Upgrade           v5.0.0     ║"
-    echo "  ║   Front-end : nginx (content-type-switched router)              ║"
-    echo "  ║   Port 80   : nginx → HTTP Upgrade only  (HTTP/1.1)             ║"
-    echo "  ║   Port 443  : nginx → XHTTP + HTTP Upgrade  (TLS, LE cert)      ║"
-    echo "  ║   CDN       : Cloudflare / CloudFront / Fastly compatible       ║"
-    echo "  ║   OS        : Ubuntu 24.04 LTS                                  ║"
-    echo "  ║                                                                  ║"
-    echo "  ╚══════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
-    if is_xray_installed; then
-        local svc_status
-        svc_status="$(systemctl is-active xray 2>/dev/null || echo 'unknown')"
-        if [[ "${svc_status}" == "active" ]]; then
-            echo -e "  Xray Status : ${GREEN}${BOLD}● Running${NC}"
-        else
-            echo -e "  Xray Status : ${RED}${BOLD}● ${svc_status}${NC}"
-        fi
-        [[ -f "${DOMAIN_FILE}" ]] && \
-            echo -e "  Domain      : ${WHITE}$(cat "${DOMAIN_FILE}")${NC}"
-    else
-        echo -e "  Xray Status : ${DIM}Not installed${NC}"
-    fi
-    echo ""
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# § 5  PRE-FLIGHT CHECKS
-# ─────────────────────────────────────────────────────────────────────────────
-
-check_root() {
+require_root() {
     if [[ "${EUID}" -ne 0 ]]; then
-        echo -e "${RED}[FATAL] This script must be run as root.${NC}"
-        echo -e "        Re-run with: ${WHITE}sudo bash ${0}${NC}"
-        exit 1
+        die "This script must be run as root (try: sudo bash $0)"
     fi
 }
 
-check_ubuntu_2404() {
+require_ubuntu() {
     if [[ ! -f /etc/os-release ]]; then
-        echo -e "${RED}[FATAL] /etc/os-release not found — cannot determine OS.${NC}"
-        exit 1
+        warn "Cannot detect OS (missing /etc/os-release). Continuing anyway, but this script targets Ubuntu 24.04 LTS."
+        return
     fi
-    # shellcheck source=/dev/null
+    # shellcheck disable=SC1091
     source /etc/os-release
-    if [[ "${ID:-}" != "ubuntu" ]] || [[ "${VERSION_ID:-}" != "24.04" ]]; then
-        echo -e "${RED}[FATAL] This script requires Ubuntu 24.04 LTS.${NC}"
-        echo -e "        Detected: ${WHITE}${PRETTY_NAME:-Unknown OS}${NC}"
-        exit 1
+    if [[ "${ID:-}" != "ubuntu" ]]; then
+        warn "Detected OS '${ID:-unknown}', not Ubuntu. This script is tested on Ubuntu 24.04 LTS only — proceed at your own risk."
+    elif [[ "${VERSION_ID:-}" != "24.04" ]]; then
+        warn "Detected Ubuntu ${VERSION_ID:-unknown}, not 24.04. Continuing, but some steps may differ."
     fi
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 6  WEB SERVER CONFLICT CHECK
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Dependency management
+# ---------------------------------------------------------------------------
+# Packages we need and the binary we check for to decide if they're present.
+# uuid-runtime -> uuidgen, dialog -> dialog (whiptail is the fallback).
+declare -A XPRO_DEPS=(
+    [curl]=curl
+    [jq]=jq
+    [uuidgen]=uuid-runtime
+    [unzip]=unzip
+    [openssl]=openssl
+    [qrencode]=qrencode
+)
 
-check_webserver_conflict() {
-    local -a CONFLICT_SERVICES=("nginx" "apache2" "apache" "lighttpd" "caddy" "httpd")
-    local -a found=()
-    for svc in "${CONFLICT_SERVICES[@]}"; do
-        if systemctl is-active --quiet "${svc}" 2>/dev/null; then
-            found+=("${svc}")
+DIALOG_BIN=""   # set by ensure_tui_backend; either "dialog" or "whiptail"
+
+apt_updated_once=0
+apt_update_once() {
+    if [[ "${apt_updated_once}" -eq 0 ]]; then
+        info "Refreshing apt package lists..."
+        if DEBIAN_FRONTEND=noninteractive apt-get update -qq; then
+            apt_updated_once=1
+        else
+            warn "apt-get update failed — package installs below may fail or use a stale cache."
+        fi
+    fi
+}
+
+install_pkg() {
+    local pkg="$1"
+    apt_update_once
+    info "Installing package: ${pkg}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkg}" >>"${XPRO_LOG}" 2>&1; then
+        die "Failed to install required package '${pkg}'. Check ${XPRO_LOG} for details."
+    fi
+}
+
+check_dependencies() {
+    info "Checking base dependencies..."
+    local bin pkg
+    for bin in "${!XPRO_DEPS[@]}"; do
+        pkg="${XPRO_DEPS[$bin]}"
+        if ! command -v "${bin}" >/dev/null 2>&1; then
+            install_pkg "${pkg}"
         fi
     done
-    if [[ ${#found[@]} -gt 0 ]]; then
-        msg_err "The following web server(s) are ACTIVE and will block ports 80/443:"
-        for s in "${found[@]}"; do
-            echo -e "      ${RED}→ ${s}${NC}"
-        done
-        echo ""
-        msg_warn "Disable them first, then re-run this script:"
-        for s in "${found[@]}"; do
-            echo -e "      ${WHITE}sudo systemctl stop ${s} && sudo systemctl disable ${s}${NC}"
-        done
-        echo ""
-        msg_err "Installation aborted: web server conflict detected." "exit"
-    fi
+    ok "Base dependencies satisfied (curl, jq, uuid-runtime, unzip, openssl, qrencode)."
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 7  INSTALL FUNCTION  (Menu option 1)
-# ─────────────────────────────────────────────────────────────────────────────
-
-install_xray() {
-    print_banner
-    msg_step "OPTION 1 — Install Xray-core (XHTTP + CDN Optimised)"
-
-    if is_xray_installed; then
-        msg_warn "Xray is already installed on this system."
-        msg_info  "To reinstall, run Option 5 (Uninstall) first, then re-run Option 1."
-        press_enter
+# Prefer 'dialog' for its nicer widgets; fall back to 'whiptail' (near-identical
+# CLI syntax) if dialog can't be installed for some reason (e.g. no universe
+# repo). Both are driven the same way in this script via the dlg() wrapper.
+ensure_tui_backend() {
+    if command -v dialog >/dev/null 2>&1; then
+        DIALOG_BIN="dialog"
+        return
+    fi
+    if command -v whiptail >/dev/null 2>&1; then
+        DIALOG_BIN="whiptail"
         return
     fi
 
-    # ── Step 1: Conflict checks ────────────────────────────────────────────────
-    msg_step "Step 1/10 — Checking for port and service conflicts"
-    check_webserver_conflict
-
-    if is_port_in_use 80; then
-        msg_err "Port 80 is already in use by an unknown process."
-        msg_err "Identify it with: ${WHITE}sudo ss -tlnp | grep ':80 '${NC}"
-        press_enter; return
-    fi
-    msg_ok "Port 80 is available."
-
-    if is_port_in_use 443; then
-        msg_err "Port 443 is already in use by an unknown process."
-        msg_err "Identify it with: ${WHITE}sudo ss -tlnp | grep ':443 '${NC}"
-        press_enter; return
-    fi
-    msg_ok "Port 443 is available."
-
-    # ── Step 2: Domain input ───────────────────────────────────────────────────
-    msg_step "Step 2/10 — Domain configuration"
-    echo -e "  ${WHITE}Enter the fully-qualified domain name for this server.${NC}"
-    echo -e "  ${DIM}Example: vpn.example.com${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Important:${NC}"
-    echo -e "   • The domain MUST have an A record pointing to this server's IP."
-    echo -e "   • If using Cloudflare, set the record to ${WHITE}DNS-only (grey cloud)${NC}"
-    echo -e "     during installation so the ACME challenge can reach this server."
-    echo -e "   • You can re-enable the orange cloud AFTER the certificate is issued."
-    echo ""
-    echo -e "  ${YELLOW}Domain name:${NC} "
-    read -r DOMAIN < /dev/tty
-
-    DOMAIN="${DOMAIN#http://}"
-    DOMAIN="${DOMAIN#https://}"
-    DOMAIN="${DOMAIN%%/*}"
-    DOMAIN="${DOMAIN%% *}"
-
-    if [[ -z "${DOMAIN}" ]] || [[ "${DOMAIN}" != *.* ]] || \
-       [[ "${DOMAIN}" =~ [[:space:]] ]]; then
-        msg_err "Invalid domain '${DOMAIN}'. Must be a valid FQDN (e.g. vpn.example.com)." "exit"
-    fi
-    msg_ok "Domain accepted: ${WHITE}${DOMAIN}${NC}"
-
-    # ── Step 3: DNS check ──────────────────────────────────────────────────────
-    msg_step "Step 3/10 — DNS resolution check"
-    SERVER_IP="$(curl -s -4 --connect-timeout 8 https://api.ipify.org 2>/dev/null || \
-                 curl -s -4 --connect-timeout 8 https://ifconfig.me  2>/dev/null || \
-                 echo 'unknown')"
-    DOMAIN_IP="$(dig +short A "${DOMAIN}" 2>/dev/null | \
-                 grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -n1 || echo '')"
-
-    echo -e "  ${WHITE}Server public IP :${NC} ${SERVER_IP}"
-    echo -e "  ${WHITE}Domain resolves  :${NC} ${DOMAIN_IP:-NOT RESOLVED}"
-    echo ""
-
-    if [[ -z "${DOMAIN_IP}" ]]; then
-        msg_warn "Domain '${DOMAIN}' did not resolve. SSL issuance will FAIL without DNS."
-    elif [[ "${SERVER_IP}" != "${DOMAIN_IP}" ]]; then
-        msg_warn "Domain IP (${DOMAIN_IP}) ≠ server IP (${SERVER_IP})."
-        msg_warn "Disable Cloudflare proxy (grey cloud) before issuing the certificate."
-    else
-        msg_ok "Domain resolves correctly to this server."
+    info "No TUI backend found — attempting to install 'dialog'..."
+    apt_update_once
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq dialog >>"${XPRO_LOG}" 2>&1 \
+        && command -v dialog >/dev/null 2>&1; then
+        DIALOG_BIN="dialog"
+        return
     fi
 
-    echo ""
-    echo -e "  ${YELLOW}Continue with domain '${DOMAIN}'? [Y/n]:${NC} "
-    read -r DNS_CONFIRM < /dev/tty
-    [[ "${DNS_CONFIRM,,}" == "n" ]] && { msg_info "Cancelled."; press_enter; return; }
-
-    mkdir -p "$(dirname "${INSTALL_LOG}")"
-    { echo "=== Xray Install Log — $(date) ==="; echo "Domain: ${DOMAIN}"; } > "${INSTALL_LOG}"
-
-    # ── Step 4: Dependencies ───────────────────────────────────────────────────
-    msg_step "Step 4/10 — Installing system dependencies"
-    msg_info "Running apt-get update..."
-    if ! apt-get update -y >>"${INSTALL_LOG}" 2>&1; then
-        msg_err "apt-get update failed. Check your internet connection." "exit"
+    warn "'dialog' install failed, trying 'whiptail'..."
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq whiptail >>"${XPRO_LOG}" 2>&1 \
+        && command -v whiptail >/dev/null 2>&1; then
+        DIALOG_BIN="whiptail"
+        return
     fi
-    msg_ok "Package lists updated."
 
-    local -a DEPS=("curl" "wget" "unzip" "jq" "uuid-runtime" \
-                   "socat" "dnsutils" "qrencode" "openssl" "nginx")
-    for dep in "${DEPS[@]}"; do
-        if cmd_exists "${dep}"; then
-            msg_ok "${dep} — already installed."
-        else
-            msg_info "Installing ${dep}..."
-            if ! apt-get install -y "${dep}" >>"${INSTALL_LOG}" 2>&1; then
-                msg_err "Failed to install '${dep}'. See ${INSTALL_LOG}." "exit"
-            fi
-            msg_ok "${dep} installed."
-        fi
-    done
-
-    # nginx is installed now but must NOT be running yet — acme.sh standalone
-    # mode (Step 6) needs port 80 completely free to issue the certificate.
-    # nginx is configured and started in the new final step, after Xray and
-    # the certificate both exist.
-    systemctl stop nginx 2>/dev/null || true
-    systemctl disable nginx >>"${INSTALL_LOG}" 2>&1 || true
-
-    # ── Step 5: acme.sh ────────────────────────────────────────────────────────
-    msg_step "Step 5/10 — Setting up acme.sh (Let's Encrypt client)"
-    if [[ -f "${ACME_BIN}" ]]; then
-        msg_ok "acme.sh already installed."
-        export PATH="${ACME_HOME}:${PATH}"
-    else
-        msg_info "Downloading acme.sh..."
-        if ! curl -fsSL "https://get.acme.sh" | bash -s "email=admin@${DOMAIN}" \
-             >>"${INSTALL_LOG}" 2>&1; then
-            msg_err "acme.sh installation failed. See ${INSTALL_LOG}." "exit"
-        fi
-        msg_ok "acme.sh installed to ${ACME_HOME}."
-    fi
-    # Ensure acme.sh is in PATH for this session
-    export PATH="${ACME_HOME}:${PATH}"
-    msg_info "Setting CA to Let's Encrypt..."
-    "${ACME_BIN}" --set-default-ca --server letsencrypt >>"${INSTALL_LOG}" 2>&1 || true
-    msg_ok "CA set: Let's Encrypt."
-
-    # ── Step 6: SSL certificate ────────────────────────────────────────────────
-    msg_step "Step 6/10 — Issuing SSL certificate for ${DOMAIN}"
-    echo -e "  ${WHITE}acme.sh standalone${NC} will start a temporary HTTP server on port 80."
-    echo -e "  ${YELLOW}Requirements:${NC}"
-    echo -e "   • Port 80 reachable from the internet."
-    echo -e "   • Domain pointing directly to this server (no CDN proxy)."
-    echo ""
-    echo -e "  ${YELLOW}Ready to issue certificate? [Y/n]:${NC} "
-    read -r CERT_CONFIRM < /dev/tty
-    [[ "${CERT_CONFIRM,,}" == "n" ]] && { msg_info "Cancelled."; press_enter; return; }
-
-    mkdir -p "${CERT_DIR}"
-    msg_info "Stopping Xray and nginx temporarily to free port 80..."
-    systemctl stop xray  2>/dev/null || true
-    systemctl stop nginx 2>/dev/null || true
-    sleep 1
-    msg_info "Issuing certificate (~30–60 seconds)..."
-    if ! "${ACME_BIN}" --issue --standalone -d "${DOMAIN}" \
-         --keylength ec-256 >>"${INSTALL_LOG}" 2>&1; then
-        echo ""
-        msg_err "SSL certificate issuance FAILED."
-        echo -e "  ${YELLOW}Common causes:${NC}"
-        echo -e "   1. Port 80 blocked — open it: ${WHITE}sudo ufw allow 80/tcp${NC}"
-        echo -e "      Also check AWS/cloud Security Group inbound rules."
-        echo -e "   2. Cloudflare orange cloud active — switch to grey (DNS only)."
-        echo -e "   3. Domain not pointing to this server IP."
-        echo -e "   4. Let's Encrypt rate limit — wait 1 hour."
-        echo -e "  Full log: ${WHITE}tail -50 ${INSTALL_LOG}${NC}"
-        press_enter; return
-    fi
-    msg_ok "Certificate issued."
-
-    msg_info "Installing certificate to ${CERT_DIR}..."
-    if ! "${ACME_BIN}" --install-cert -d "${DOMAIN}" --ecc \
-         --key-file       "${CERT_KEY}"       \
-         --fullchain-file "${CERT_FULLCHAIN}" \
-         --pre-hook  "systemctl stop  nginx 2>/dev/null; true" \
-         --post-hook "systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null; true" \
-         >>"${INSTALL_LOG}" 2>&1; then
-        msg_err "Certificate copy failed. See ${INSTALL_LOG}." "exit"
-    fi
-    chmod 600 "${CERT_KEY}"
-    chmod 644 "${CERT_FULLCHAIN}"
-    msg_ok "Certificate installed. Auto-renewal hooks registered."
-
-    # ── Step 7: Download Xray binary ───────────────────────────────────────────
-    msg_step "Step 7/10 — Downloading and installing Xray-core"
-
-    local ARCH XRAY_ARCH
-    ARCH="$(uname -m)"
-    case "${ARCH}" in
-        x86_64)        XRAY_ARCH="64"        ;;
-        aarch64|arm64) XRAY_ARCH="arm64-v8a" ;;
-        armv7l)        XRAY_ARCH="arm32-v7a" ;;
-        armv6l)        XRAY_ARCH="arm32-v6"  ;;
-        *) msg_err "Unsupported CPU architecture: ${ARCH}." "exit" ;;
-    esac
-    msg_ok "Architecture: ${ARCH} → Xray-linux-${XRAY_ARCH}"
-
-    msg_info "Querying GitHub API for latest Xray-core release..."
-    local XRAY_VERSION
-    XRAY_VERSION="$(curl -s --connect-timeout 10 "${XRAY_RELEASE_API}" 2>/dev/null \
-                    | jq -r '.tag_name // empty' 2>/dev/null || echo '')"
-    if [[ -z "${XRAY_VERSION}" ]]; then
-        msg_warn "GitHub API unreachable. Falling back to v24.11.11."
-        XRAY_VERSION="v24.11.11"
-    fi
-    msg_ok "Target version: ${WHITE}${XRAY_VERSION}${NC}"
-
-    local XRAY_ZIP_URL="${XRAY_DL_BASE}/${XRAY_VERSION}/Xray-linux-${XRAY_ARCH}.zip"
-    local XRAY_ZIP="/tmp/xray-linux-${XRAY_ARCH}.zip"
-
-    msg_info "Downloading: ${XRAY_ZIP_URL}"
-    if ! curl -fsSL --connect-timeout 30 -o "${XRAY_ZIP}" "${XRAY_ZIP_URL}"; then
-        msg_err "Download failed." "exit"
-    fi
-    msg_ok "Download complete."
-
-    local XRAY_EXTRACT="/tmp/xray-extract-$$"
-    mkdir -p "${XRAY_EXTRACT}"
-    if ! unzip -o "${XRAY_ZIP}" -d "${XRAY_EXTRACT}" >>"${INSTALL_LOG}" 2>&1; then
-        msg_err "Failed to extract ${XRAY_ZIP}." "exit"
-    fi
-    install -m 755 "${XRAY_EXTRACT}/xray" "${XRAY_BIN}"
-    msg_ok "Xray binary installed: ${XRAY_BIN}"
-    rm -rf "${XRAY_EXTRACT}" "${XRAY_ZIP}"
-
-    # ── Step 7b: Geo-data files (v2.3.0 definitive fix) ───────────────────────
-    # The geo files MUST live in GEO_DIR (/usr/local/share/xray).
-    # The systemd service exports XRAY_LOCATION_ASSET pointing here.
-    # Creating the directory first is the fix for "curl: (23) Failure writing
-    # output to destination" errors seen in earlier versions.
-    msg_info "Creating geo-data directory: ${GEO_DIR}"
-    mkdir -p "${GEO_DIR}"
-
-    download_file \
-        "${GEOIP_URL_PRIMARY}" \
-        "${GEOIP_URL_FALLBACK}" \
-        "${GEO_DIR}/geoip.dat" \
-        "geoip.dat"
-
-    download_file \
-        "${GEOSITE_URL_PRIMARY}" \
-        "${GEOSITE_URL_FALLBACK}" \
-        "${GEO_DIR}/geosite.dat" \
-        "geosite.dat"
-
-    # Verify files exist and are non-empty
-    if [[ ! -s "${GEO_DIR}/geoip.dat" ]] || [[ ! -s "${GEO_DIR}/geosite.dat" ]]; then
-        msg_err "Geo-data files are empty or missing after download." "exit"
-    fi
-    msg_ok "Geo-data ready: $(ls -lh ${GEO_DIR}/*.dat | awk '{print $5, $9}' | tr '\n' '  ')"
-
-    # ── Step 8: Config files ───────────────────────────────────────────────────
-    msg_step "Step 8/10 — Creating configuration files"
-
-    local XHTTP_PATH UPGRADE_PATH
-    XHTTP_PATH="/$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
-    UPGRADE_PATH="/$(tr -dc 'a-z0-9' < /dev/urandom | head -c 12)"
-    msg_ok "Generated XHTTP path   : ${WHITE}${XHTTP_PATH}${NC}"
-    msg_ok "Generated Upgrade path : ${WHITE}${UPGRADE_PATH}${NC}"
-
-    mkdir -p "${XRAY_CONFIG_DIR}" "${LOG_DIR}" "${CERT_DIR}"
-    touch "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
-    chmod 640 "${LOG_DIR}/access.log" "${LOG_DIR}/error.log"
-
-    echo "${DOMAIN}"       > "${DOMAIN_FILE}"
-    echo "${XHTTP_PATH}"   > "${PATH_FILE}"
-    echo "${UPGRADE_PATH}" > "${UPGRADE_PATH_FILE}"
-
-    local INIT_UUID INIT_USER
-    INIT_UUID="$(uuidgen)"
-    INIT_USER="user01"
-    msg_ok "Initial user: ${WHITE}${INIT_USER}${NC}  UUID: ${WHITE}${INIT_UUID}${NC}"
-
-    # Write config.json
-    # Two INTERNAL, loopback-only inbounds. nginx owns ports 80 and 443
-    # publicly, terminates TLS itself, and routes by path to whichever
-    # inbound matches — XHTTP requests go to xhttp-inner via grpc_pass.
-    # FIX: previously claimed "mode:auto/packet-up speaks HTTP/2 framing" —
-    # that was backwards. packet-up is plain chunked HTTP/1.1 and does NOT
-    # pair with grpc_pass; it's mode=auto negotiating to stream-up under
-    # TLS+H2 that sends the gRPC-style framing grpc_pass expects (verified:
-    # XTLS/Xray-core discussion #4113). If grpc_pass ever fails to
-    # penetrate a given network path, the documented fallback is mode=
-    # packet-up on both sides with plain proxy_pass instead — not mixing
-    # the two on one path.
-    # HTTP Upgrade requests go to upgrade-inner via proxy_pass with
-    # Connection:Upgrade headers (it's a real HTTP/1.1 upgrade, like
-    # WebSocket). Neither inner inbound sets "path" or "host" in its
-    # settings — nginx already does the path matching, and setting path
-    # again on the Xray side is a documented conflict: in
-    # github.com/XTLS/Xray-core/discussions/5822, a server that had path
-    # set in xhttpSettings accepted every request (visible in its own
-    # logs) but the client never received a response; removing path from
-    # xhttpSettings was the confirmed fix.
-    # Routing: block private/LAN IPs to prevent SSRF (uses geoip:private
-    # from the geo files we just downloaded)
-    cat > "${CONFIG_FILE}" << EOF
-{
-  "log": {
-    "loglevel": "warning",
-    "access": "${LOG_DIR}/access.log",
-    "error":  "${LOG_DIR}/error.log"
-  },
-  "inbounds": [
-    {
-      "tag": "xhttp-inner",
-      "port": ${PORT_XHTTP_INNER},
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${INIT_UUID}",
-            "email": "${INIT_USER}"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "security": "none",
-        "xhttpSettings": {
-          "mode": "auto",
-          "extra": {
-            "scMaxEachPostBytes": 1000000,
-            "scMinPostsIntervalMs": 30,
-            "xPaddingBytes": "100-1000",
-            "noGRPCHeader": false
-          }
-        }
-      },
-      "sniffing": { "enabled": false }
-    },
-    {
-      "tag": "upgrade-inner",
-      "port": ${PORT_UPGRADE_INNER},
-      "listen": "127.0.0.1",
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "${INIT_UUID}",
-            "email": "${INIT_USER}"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "httpupgrade",
-        "security": "none",
-        "httpupgradeSettings": {}
-      },
-      "sniffing": { "enabled": false }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "direct",
-      "protocol": "freedom",
-      "settings": { "domainStrategy": "UseIPv4v6" }
-    },
-    {
-      "tag": "block",
-      "protocol": "blackhole",
-      "settings": { "response": { "type": "http" } }
-    }
-  ],
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      {
-        "type": "field",
-        "ip": ["geoip:private"],
-        "outboundTag": "block",
-        "remark": "Block RFC-1918 LAN destinations (SSRF prevention)"
-      }
-    ]
-  },
-  "policy": {
-    "levels": {
-      "0": {
-        "handshake": 4,
-        "connIdle": 300,
-        "uplinkOnly": 1,
-        "downlinkOnly": 1
-      }
-    },
-    "system": {
-      "statsInboundUplink": false,
-      "statsInboundDownlink": false
-    }
-  }
+    die "Could not install either 'dialog' or 'whiptail'. A text UI backend is required."
 }
-EOF
-    msg_ok "config.json written to ${CONFIG_FILE}."
 
-    # ── Step 9: systemd service + firewall ─────────────────────────────────────
-    msg_step "Step 9/10 — Creating systemd service and configuring firewall"
+# Thin wrapper so every call site doesn't need to branch on dialog vs
+# whiptail. Both tools accept the same flags for the widgets we use
+# (--menu, --inputbox, --yesno, --msgbox, --passwordbox, --checklist).
+dlg() {
+    "${DIALOG_BIN}" --backtitle "xpro — Xray VLESS/XTLS-Vision/REALITY manager v${XPRO_VERSION}" "$@"
+}
 
-    # v2.3.0 KEY FIX: The Environment= line tells Xray exactly where to find
-    # geoip.dat and geosite.dat. Without this, Xray defaults to searching
-    # /usr/local/bin/ or the binary's directory — neither of which has the files.
-    cat > "${SERVICE_FILE}" << SYSTEMD_EOF
+# ---------------------------------------------------------------------------
+# Local database (source of truth for expiry — NEVER stored in Xray config)
+# ---------------------------------------------------------------------------
+# Schema:
+# {
+#   "users": [
+#     {
+#       "username": "alice",
+#       "uuid": "xxxxxxxx-xxxx-...",
+#       "short_id": "a1b2c3d4",
+#       "created_at": "2026-07-10T12:00:00Z",
+#       "expires_at": "2026-08-09T12:00:00Z",
+#       "enabled": true
+#     }
+#   ]
+# }
+#
+# "enabled" tracks whether the user is currently present in config.json.
+# The daily sweep sets it to false (and removes from config.json) once
+# expires_at is in the past; it does NOT delete the DB row, so history and
+# "extend after expiry" both remain possible.
+
+db_init() {
+    mkdir -p "${XPRO_HOME}" "${XPRO_BACKUP_DIR}"
+    chmod 700 "${XPRO_HOME}"
+    if [[ ! -f "${XPRO_DB}" ]]; then
+        info "Initializing local database at ${XPRO_DB}"
+        printf '{"users": []}' | jq '.' >"${XPRO_DB}"
+        chmod 600 "${XPRO_DB}"
+    fi
+    # Validate on every startup — a hand-edited or half-written DB should be
+    # caught immediately rather than corrupting the next write.
+    if ! jq -e . "${XPRO_DB}" >/dev/null 2>&1; then
+        die "Database file ${XPRO_DB} is not valid JSON. Restore from ${XPRO_BACKUP_DIR} or fix manually before continuing."
+    fi
+}
+
+# Atomically write a jq filter's result back to the DB. Never edits the DB
+# file in place — always writes to a temp file in the same directory (so the
+# final `mv` is on the same filesystem and therefore atomic) and only
+# replaces the real file if the jq run succeeded AND produced valid JSON.
+# $1 = jq filter, remaining args = extra --arg/--argjson pairs.
+db_write() {
+    local filter="$1"
+    shift
+    local tmp
+    tmp="$(mktemp "${XPRO_HOME}/.db.XXXXXX.json")"
+
+    if ! jq "$@" "${filter}" "${XPRO_DB}" >"${tmp}" 2>>"${XPRO_LOG}"; then
+        rm -f "${tmp}"
+        die "Database update failed (jq error) — no changes were made. See ${XPRO_LOG}."
+    fi
+    if ! jq -e . "${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        die "Database update produced invalid JSON — aborting before overwrite."
+    fi
+
+    cp -p "${XPRO_DB}" "${XPRO_BACKUP_DIR}/db.json.$(date +%s).bak" 2>/dev/null || true
+    chmod 600 "${tmp}"
+    mv -f "${tmp}" "${XPRO_DB}"
+    # Keep only the last 20 backups so this doesn't grow forever.
+    find "${XPRO_BACKUP_DIR}" -maxdepth 1 -name 'db.json.*.bak' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | tail -n +21 | cut -d' ' -f2- | xargs -r rm -f
+}
+
+db_user_exists() {
+    local username="$1"
+    jq -e --arg u "${username}" '.users[] | select(.username == $u)' "${XPRO_DB}" >/dev/null 2>&1
+}
+
+db_add_user() {
+    local username="$1" uuid="$2" short_id="$3" created_at="$4" expires_at="$5"
+    db_write '(.users) += [{
+            username:   $username,
+            uuid:       $uuid,
+            short_id:   $short_id,
+            created_at: $created_at,
+            expires_at: $expires_at,
+            enabled:    true
+        }]' \
+        --arg username "${username}" \
+        --arg uuid "${uuid}" \
+        --arg short_id "${short_id}" \
+        --arg created_at "${created_at}" \
+        --arg expires_at "${expires_at}"
+}
+
+db_remove_user() {
+    local username="$1"
+    db_write '.users |= map(select(.username != $u))' --arg u "${username}"
+}
+
+db_set_enabled() {
+    local username="$1" enabled="$2"   # enabled: "true" | "false"
+    db_write '.users |= map(if .username == $u then .enabled = ($e == "true") else . end)' \
+        --arg u "${username}" --arg e "${enabled}"
+}
+
+db_extend_user() {
+    local username="$1" new_expiry="$2"
+    db_write '.users |= map(if .username == $u then .expires_at = $exp else . end)' \
+        --arg u "${username}" --arg exp "${new_expiry}"
+}
+
+db_get_user_field() {
+    local username="$1" field="$2"
+    jq -r --arg u "${username}" --arg f "${field}" '.users[] | select(.username == $u) | .[$f]' "${XPRO_DB}"
+}
+
+# Returns tab-separated: username, expires_at, enabled — one line per user,
+# for building menu lists.
+db_list_users() {
+    jq -r '.users[] | [.username, .expires_at, (.enabled|tostring)] | @tsv' "${XPRO_DB}"
+}
+
+db_list_expired_enabled_users() {
+    local now="$1"   # ISO8601 UTC "now" to compare against
+    jq -r --arg now "${now}" \
+        '.users[] | select(.enabled == true and .expires_at < $now) | .username' \
+        "${XPRO_DB}"
+}
+
+# ---------------------------------------------------------------------------
+# Xray install / binary management
+# ---------------------------------------------------------------------------
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo "64" ;;
+        aarch64|arm64) echo "arm64-v8a" ;;
+        armv7l)        echo "arm32-v7a" ;;
+        s390x)         echo "s390x" ;;
+        *) die "Unsupported CPU architecture: $(uname -m). Xray-core release assets don't cover this." ;;
+    esac
+}
+
+xray_is_installed() {
+    [[ -x "${XRAY_BIN}" ]] && "${XRAY_BIN}" version >/dev/null 2>&1
+}
+
+# Downloads and installs (or upgrades) the Xray-core binary from the official
+# GitHub Releases API — always "latest", per XTLS/Xray-core.
+install_xray_binary() {
+    local arch tag download_url tmp_dir zip_path
+    arch="$(detect_arch)"
+
+    info "Querying GitHub Releases API for the latest Xray-core version..."
+    tag="$(curl -fsSL "${XRAY_RELEASES_API}" | jq -r '.tag_name // empty')"
+    if [[ -z "${tag}" ]]; then
+        die "Could not determine the latest Xray-core release tag from ${XRAY_RELEASES_API}. Check network/DNS/GitHub API rate limits."
+    fi
+    ok "Latest Xray-core release: ${tag}"
+
+    download_url="https://github.com/XTLS/Xray-core/releases/download/${tag}/Xray-linux-${arch}.zip"
+    tmp_dir="$(mktemp -d)"
+    zip_path="${tmp_dir}/xray.zip"
+
+    info "Downloading ${download_url}"
+    if ! curl -fL --retry 3 --retry-delay 2 -o "${zip_path}" "${download_url}"; then
+        rm -rf "${tmp_dir}"
+        die "Download failed for ${download_url}. If your arch/OS combo isn't published upstream, install manually."
+    fi
+
+    info "Extracting..."
+    if ! unzip -oq "${zip_path}" -d "${tmp_dir}"; then
+        rm -rf "${tmp_dir}"
+        die "Failed to unzip the downloaded Xray-core release."
+    fi
+    if [[ ! -f "${tmp_dir}/xray" ]]; then
+        rm -rf "${tmp_dir}"
+        die "Downloaded archive did not contain an 'xray' binary as expected."
+    fi
+
+    # Stop the service before replacing the binary out from under it, if running.
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        info "Stopping xray.service for binary upgrade..."
+        systemctl stop xray
+    fi
+
+    install -d -m 755 "${XRAY_BIN_DIR}"
+    install -m 755 "${tmp_dir}/xray" "${XRAY_BIN}"
+    install -d -m 755 "${XRAY_ETC_DIR}"
+    install -d -m 750 "${XRAY_LOG_DIR}"
+
+    rm -rf "${tmp_dir}"
+
+    if ! "${XRAY_BIN}" version >/dev/null 2>&1; then
+        die "xray binary installed at ${XRAY_BIN} but fails to execute — check architecture compatibility."
+    fi
+    ok "Installed $("${XRAY_BIN}" version | head -n1)"
+}
+
+install_systemd_unit() {
+    info "Writing systemd unit ${XRAY_SYSTEMD_UNIT}"
+    cat >"${XRAY_SYSTEMD_UNIT}" <<EOF
 [Unit]
-Description=Xray-core (VLESS+XHTTP/HTTPUpgrade, internal — fronted by nginx)
-Documentation=https://github.com/XTLS/Xray-core
+Description=Xray Service (managed by xpro)
+Documentation=https://github.com/xtls/xray-core
 After=network.target nss-lookup.target
 
 [Service]
+Type=simple
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
-Environment=XRAY_LOCATION_ASSET=${GEO_DIR}
-ExecStart=${XRAY_BIN} run -config ${CONFIG_FILE}
-ExecReload=/bin/kill -HUP \$MAINPID
+ExecStart=${XRAY_BIN} run -config ${XRAY_CONFIG}
 Restart=on-failure
-RestartSec=5s
 RestartPreventExitStatus=23
 LimitNPROC=10000
 LimitNOFILE=1000000
 
 [Install]
 WantedBy=multi-user.target
-SYSTEMD_EOF
-
-    msg_ok "systemd unit written: ${SERVICE_FILE}"
-    msg_ok "  XRAY_LOCATION_ASSET=${GEO_DIR} (geo-data path set correctly)"
-
+EOF
     systemctl daemon-reload
-
-    if ! systemctl enable xray >>"${INSTALL_LOG}" 2>&1; then
-        msg_err "Failed to enable xray service." "exit"
-    fi
-    msg_ok "Xray enabled (starts on boot)."
-
-    # Test the config before attempting to start
-    msg_info "Validating config.json..."
-    if ! "${XRAY_BIN}" -test -config "${CONFIG_FILE}" >>"${INSTALL_LOG}" 2>&1; then
-        msg_err "Config validation FAILED. Check: ${WHITE}tail -20 ${INSTALL_LOG}${NC}"
-        press_enter; return
-    fi
-    msg_ok "Config validation passed."
-
-    if ! systemctl start xray; then
-        msg_err "Xray failed to start."
-        msg_err "Run: ${WHITE}journalctl -u xray -n 30 --no-pager -l${NC}"
-        press_enter; return
-    fi
-
-    sleep 2
-
-    if systemctl is-active --quiet xray; then
-        msg_ok "Xray service is ${GREEN}${BOLD}running${NC}."
-    else
-        msg_warn "Xray may not be running — use Option 4 to investigate."
-    fi
-
-    if cmd_exists ufw; then
-        ufw allow OpenSSH                                  >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 80/tcp  comment 'nginx — HTTP Upgrade NTLS/CDN' >>"${INSTALL_LOG}" 2>&1 || true
-        ufw allow 443/tcp comment 'nginx — XHTTP+Upgrade TLS'      >>"${INSTALL_LOG}" 2>&1 || true
-        msg_ok "UFW: ports 22, 80 and 443 opened. Inner Xray ports stay loopback-only."
-    else
-        msg_warn "UFW not found. Open ports 80/443 in your cloud security group manually."
-    fi
-
-    # ── Step 10: nginx reverse proxy (path-based router for both transports) ───
-    msg_step "Step 10/10 — Configuring nginx as the public-facing router"
-    #
-    # nginx owns ports 80 and 443. It terminates TLS itself on 443 (Let's
-    # Encrypt cert from Step 6). Port 443 negotiates HTTP/1.1 vs HTTP/2 via
-    # TLS ALPN (works on any nginx version). Port 80 is plain HTTP/1.1 only
-    # — see the FIX comment on the port-80 server block below for why.
-    #
-    # FIX (see inline comments in the generated nginx config for the full
-    # explanation, sources, and a v5.0.1/v5.0.2 patch-note summary at the
-    # top of the file): two separate connection-breaking bugs were found
-    # and fixed here, both root-caused against a live deployment rather
-    # than assumed:
-    #   1. The XHTTP nginx location used an exact match ("location =") for
-    #      a transport that always requests sub-paths under the configured
-    #      path (/<path>/<session-uuid>) — confirmed via a real nginx error
-    #      log in XTLS/Xray-core discussion #5822. Every real XHTTP request
-    #      404'd. Fixed: prefix-match location, matching the official
-    #      XTLS/Xray-examples/VLESS-XHTTP3-Nginx/nginx.conf template, with
-    #      a single unconditional grpc_pass instead of an unverified
-    #      runtime if($content_type) dispatch between grpc_pass/proxy_pass.
-    #   2. "listen 80 http2;" makes a cleartext nginx socket HTTP/2-ONLY
-    #      with no HTTP/1.1 fallback on nginx < 1.25.1 — and Ubuntu 24.04's
-    #      stock nginx is 1.24.0. This was confirmed live: curl against
-    #      port 80 returned "Received HTTP/0.9 when not allowed", the
-    #      exact signature of an HTTP/1.1 request hitting an h2c-only
-    #      socket — and independently confirmed against nginx's own bug
-    #      tracker (trac.nginx.org/nginx/ticket/816: "HTTP/1.1 clients
-    #      will fail on the socket, preventing the use of HTTP Upgrade").
-    #      Fixed: port 80 is now plain HTTP/1.1, serving HTTP Upgrade only.
-    #      XHTTP is TLS-only (port 443), where ALPN handles the HTTP/1.1
-    #      vs HTTP/2 split correctly regardless of nginx version.
-    #   HTTP Upgrade is a plain HTTP/1.1 `Connection: Upgrade` handshake
-    #   targeting a single fixed path (never sub-paths), so it keeps its
-    #   exact-match location and plain proxy_pass on both ports — unchanged.
-
-    mkdir -p /var/www/html
-    if [[ ! -f /var/www/html/index.html ]]; then
-        cat > /var/www/html/index.html << 'HTML_EOF'
-<!DOCTYPE html>
-<html><head><title>Welcome</title></head>
-<body><h1>It works.</h1></body></html>
-HTML_EOF
-    fi
-
-    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
-
-    cat > /etc/nginx/sites-available/xray-router << NGINX_EOF
-# ── Port 80 — plain HTTP/1.1: HTTP Upgrade only ─────────────────────────────
-# FIX (live-debugged, root cause confirmed): "listen 80 http2;" makes this
-# socket HTTP/2-only with NO fallback to HTTP/1.1 on Ubuntu 24.04's stock
-# nginx package (1.24.0). Every plain HTTP/1.1 request — including the
-# HTTP Upgrade handshake this port exists to serve — gets rejected; nginx
-# tries to parse it as an HTTP/2 client preface and the client sees garbage
-# ("Received HTTP/0.9 when not allowed" from curl is the exact symptom of
-# this). Confirmed via nginx's own bug tracker: a cleartext "http2" listen
-# socket accepts ONLY prior-knowledge HTTP/2 and "HTTP/1.1 clients will
-# fail on the socket, preventing the use of HTTP Upgrade" — that limitation
-# was fixed in nginx 1.25.1, but Ubuntu 24.04 ships 1.24.0.
-# Source: https://trac.nginx.org/nginx/ticket/816 (closed/fixed in 1.25.1)
-# and https://trac.nginx.org/nginx/ticket/808.
-# Fix: drop "http2" from this listener (plain HTTP/1.1) and drop the XHTTP
-# location from this port entirely — grpc_pass requires nginx to actually
-# be speaking HTTP/2 to the client, which a plain HTTP/1.1 socket cannot
-# do. XHTTP is TLS-only in this deployment now (port 443, where ALPN
-# correctly negotiates h2 vs HTTP/1.1 on the same socket — see the FIX
-# comment on the port 443 block). HTTP Upgrade is unaffected: it's a real
-# HTTP/1.1 Connection:Upgrade handshake and works correctly on this socket.
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
-
-    root /var/www/html;
-    index index.html;
-
-    client_max_body_size 0;
-    client_body_timeout   1d;
-    client_header_timeout 1d;
-    keepalive_timeout     1d;
-
-    # HTTP Upgrade — always a real HTTP/1.1 Connection:Upgrade handshake,
-    # never gRPC, so this is plain proxy_pass with Upgrade headers.
-    # (Verified: HTTPUpgrade always targets a single fixed path with no
-    # session sub-paths, per xtls.github.io/en/config/transports/httpupgrade.html,
-    # so the exact-match "location =" here is correct and was NOT changed.)
-    location = /${UPGRADE_PATH#/} {
-        if (\$http_upgrade != "websocket") { return 404; }
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 1d;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:${PORT_UPGRADE_INNER};
-    }
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
+    systemctl enable xray >/dev/null 2>&1
 }
 
-# ── Port 443 — TLS direct (Let's Encrypt cert, no CDN in front) ────────────
-# XHTTP is now TLS-only (this block) — see the patch-note summary near the
-# top of this file (v5.0.2) for why it was removed from port 80. TLS+H2
-# (ALPN negotiates h2) is the well-verified condition under which XHTTP's
-# mode=auto selects stream-up and sends gRPC-disguised frames, and ALPN
-# correctly serves HTTP/1.1 and HTTP/2 on the same socket regardless of
-# nginx version, which is why this port (not 80) is the reliable path for
-# both transports.
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${DOMAIN};
-
-    ssl_certificate     ${CERT_FULLCHAIN};
-    ssl_certificate_key ${CERT_KEY};
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_prefer_server_ciphers off;
-
-    root /var/www/html;
-    index index.html;
-
-    client_max_body_size 0;
-    client_body_timeout   1d;
-    client_header_timeout 1d;
-    keepalive_timeout     1d;
-
-    # XHTTP — prefix-match location (Xray requests /${XHTTP_PATH}/<session-uuid>,
-    # never the bare path) with a single unconditional grpc_pass. See the
-    # v5.0.1 patch note near the top of this file for the verified sources.
-    location /${XHTTP_PATH#/}/ {
-        client_max_body_size 0;
-        client_body_buffer_size 512k;
-        grpc_read_timeout 1d;
-        grpc_send_timeout 1d;
-        grpc_set_header Host \$host;
-        grpc_set_header X-Real-IP \$remote_addr;
-        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        grpc_pass grpc://127.0.0.1:${PORT_XHTTP_INNER};
-    }
-
-    location = /${UPGRADE_PATH#/} {
-        if (\$http_upgrade != "websocket") { return 404; }
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 1d;
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:${PORT_UPGRADE_INNER};
-    }
-
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-}
-NGINX_EOF
-
-    ln -sf /etc/nginx/sites-available/xray-router /etc/nginx/sites-enabled/xray-router
-
-    # Verify nginx actually has gRPC support compiled in. The stock Ubuntu
-    # 'nginx' apt package (nginx-core) includes ngx_http_grpc_module by
-    # default, but nginx-light does not — if grpc_pass is unrecognized,
-    # nginx -t fails with "unknown directive" which is confusing without
-    # this explicit check pointing at the real cause.
-    if ! nginx -V 2>&1 | grep -q 'http_v2_module\|grpc'; then
-        msg_warn "Could not confirm gRPC/HTTP2 module support in this nginx build."
-        msg_warn "If 'nginx -t' below fails with 'unknown directive grpc_pass',"
-        msg_warn "run: ${WHITE}apt-get install --reinstall nginx${NC} (not nginx-light)."
+restart_xray() {
+    info "Validating config before restart..."
+    if ! "${XRAY_BIN}" run -test -config "${XRAY_CONFIG}" >>"${XPRO_LOG}" 2>&1; then
+        err "Xray config failed validation (xray run -test). NOT restarting the live service."
+        err "See ${XPRO_LOG} for the validator's output, and ${XRAY_CONFIG} for the file itself."
+        return 1
     fi
-
-    if ! nginx -t >>"${INSTALL_LOG}" 2>&1; then
-        msg_err "nginx config test FAILED. Check: ${WHITE}nginx -t${NC} and ${INSTALL_LOG}"
-        press_enter; return
-    fi
-    msg_ok "nginx config syntax OK."
-
-    systemctl enable nginx  >>"${INSTALL_LOG}" 2>&1 || true
-    if ! systemctl restart nginx; then
-        msg_err "nginx failed to start. Run: ${WHITE}journalctl -u nginx -n 30 --no-pager${NC}"
-        press_enter; return
-    fi
+    systemctl restart xray
     sleep 1
-    if systemctl is-active --quiet nginx; then
-        msg_ok "nginx is ${GREEN}${BOLD}running${NC} and routing ports 80/443."
-    else
-        msg_warn "nginx may not be running — use Option 4 to investigate."
+    if ! systemctl is-active --quiet xray; then
+        err "xray.service failed to start after restart. Recent logs:"
+        journalctl -u xray -n 20 --no-pager >&2 || true
+        return 1
     fi
-
-    separator
-    echo ""
-    echo -e "${GREEN}${BOLD}  ✔  Installation complete!${NC}"
-    echo ""
-    echo -e "  ${WHITE}Domain         :${NC} ${DOMAIN}"
-    echo -e "  ${WHITE}XHTTP path     :${NC} ${XHTTP_PATH}"
-    echo -e "  ${WHITE}Upgrade path   :${NC} ${UPGRADE_PATH}"
-    echo -e "  ${WHITE}Port 80        :${NC} nginx — HTTP Upgrade only, plain HTTP/1.1"
-    echo -e "  ${WHITE}Port 443       :${NC} nginx — XHTTP + HTTP Upgrade, TLS (Let's Encrypt cert)"
-    echo -e "  ${WHITE}Internal ports :${NC} ${PORT_XHTTP_INNER} (XHTTP) / ${PORT_UPGRADE_INNER} (Upgrade) — loopback only"
-    echo -e "  ${WHITE}Initial user   :${NC} ${INIT_USER}  UUID: ${INIT_UUID}"
-    echo -e "  ${WHITE}Geo-data       :${NC} ${GEO_DIR}/"
-    echo ""
-    echo -e "  ${YELLOW}Next steps:${NC}"
-    echo -e "   • Option 3 — view client connection strings and QR codes."
-    echo -e "   • Option 2 — add more users."
-    echo -e "   • Re-enable Cloudflare orange cloud for ${DOMAIN} if desired."
-    echo ""
-    separator
-    press_enter
+    ok "xray.service restarted successfully."
+    return 0
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 8  ADD USER  (Menu option 2)
-# ─────────────────────────────────────────────────────────────────────────────
-
-add_user() {
-    print_banner
-    msg_step "OPTION 2 — Add New Xray User"
-
-    if ! is_xray_installed; then
-        msg_err "Xray is not installed. Please run Option 1 first."
-        press_enter; return
+# ---------------------------------------------------------------------------
+# REALITY keypair generation
+# ---------------------------------------------------------------------------
+# IMPORTANT VERSION NOTE:
+#   Older Xray-core: `xray x25519` prints "Private key:" / "Public key:"
+#   (note the space before "key").
+#   Newer Xray-core (v25.3.6+): it prints "PrivateKey:" / "Password:" /
+#   "Hash32:" (no space), where "Password" IS the value that used to be
+#   called "Public key" (confirmed via XTLS/Xray-core discussion #5219 — the
+#   devs renamed it specifically so people don't casually paste it around,
+#   since it's usable to probe for REALITY servers).
+#   Some current builds print all three lines together (Private key: /
+#   Public key: / Password:), so we treat "Public key" and "Password" as
+#   alternatives and prefer "Public key" when both are present, rather than
+#   assuming the two label sets are mutually exclusive.
+#   We must not hardcode one label set, since "the latest version" is a
+#   moving target by design of this script (it always installs latest) — so
+#   we parse robustly for old, new, and combined output.
+generate_reality_keys() {
+    local raw private_key public_key
+    raw="$("${XRAY_BIN}" x25519 2>/dev/null)"
+    if [[ -z "${raw}" ]]; then
+        die "xray x25519 produced no output — cannot generate REALITY keys."
     fi
 
-    echo ""
-    echo -e "  ${WHITE}Username rules:${NC} letters, numbers, hyphens, underscores only."
-    echo ""
-    echo -e "  ${YELLOW}New username:${NC} "
-    read -r USERNAME < /dev/tty
-
-    if [[ -z "${USERNAME}" ]] || [[ "${USERNAME}" =~ [^a-zA-Z0-9_-] ]]; then
-        msg_err "Invalid username '${USERNAME}'. Allowed: a-z A-Z 0-9 _ -"
-        press_enter; return
+    # grep -i 'Private ?Key:' matches both "Private key:" (old, spaced) and
+    # "PrivateKey:" (new, unspaced) case-insensitively; cut -d: -f2 takes
+    # everything after the first colon (safe here since base64url key
+    # material never contains a literal ':'), then we strip whitespace/CR.
+    private_key="$(echo "${raw}" | grep -iE '^Private ?Key:' | head -n1 | cut -d: -f2 | tr -d ' \r')"
+    public_key="$(echo "${raw}" | grep -iE '^Public ?Key:' | head -n1 | cut -d: -f2 | tr -d ' \r')"
+    if [[ -z "${public_key}" ]]; then
+        public_key="$(echo "${raw}" | grep -iE '^Password:' | head -n1 | cut -d: -f2 | tr -d ' \r')"
     fi
 
-    if jq -e --arg em "${USERNAME}" \
-          '.inbounds[0].settings.clients[] | select(.email == $em)' \
-          "${CONFIG_FILE}" >/dev/null 2>&1; then
-        msg_err "User '${USERNAME}' already exists."
-        press_enter; return
+    if [[ -z "${private_key}" || -z "${public_key}" ]]; then
+        err "Could not parse 'xray x25519' output. Raw output was:"
+        echo "${raw}" >&2
+        die "REALITY key generation failed — unrecognized xray x25519 output format."
     fi
 
-    local NEW_UUID
-    NEW_UUID="$(uuidgen)"
-    msg_info "Generated UUID: ${WHITE}${NEW_UUID}${NC}"
-
-    local TMP_CFG
-    TMP_CFG="$(mktemp)"
-
-    if jq --arg uuid "${NEW_UUID}" --arg em "${USERNAME}" \
-       '(.inbounds[] | .settings.clients) += [{"id": $uuid, "email": $em, "flow": ""}]' \
-       "${CONFIG_FILE}" > "${TMP_CFG}"; then
-        if jq empty "${TMP_CFG}" 2>/dev/null; then
-            mv "${TMP_CFG}" "${CONFIG_FILE}"
-            msg_ok "User '${USERNAME}' added to both inbounds (XHTTP + Upgrade)." # FIX: was "all 4 inbounds" — config.json only ever had 2 (xhttp-inner, upgrade-inner); stale text from the old v4.0.0 per-port-inbound layout
-        else
-            msg_err "jq produced invalid JSON. Config unchanged."
-            rm -f "${TMP_CFG}"; press_enter; return
-        fi
-    else
-        msg_err "jq failed. Config unchanged."
-        rm -f "${TMP_CFG}"; press_enter; return
-    fi
-
-    msg_info "Restarting Xray..."
-    if systemctl restart xray; then
-        msg_ok "Xray restarted. User '${USERNAME}' is now active."
-    else
-        msg_err "Xray failed to restart! Run: journalctl -u xray -n 30 --no-pager"
-    fi
-
-    echo ""
-    echo -e "  ${GREEN}${BOLD}User created!${NC}"
-    echo -e "  ${WHITE}Username :${NC} ${USERNAME}"
-    echo -e "  ${WHITE}UUID     :${NC} ${NEW_UUID}"
-    echo ""
-    echo -e "  ${YELLOW}Use Option 3 to generate the client connection strings.${NC}"
-    press_enter
+    mkdir -p "${XPRO_HOME}"
+    jq -n --arg priv "${private_key}" --arg pub "${public_key}" \
+        '{private_key: $priv, public_key: $pub}' >"${XPRO_KEYS}"
+    chmod 600 "${XPRO_KEYS}"
+    ok "REALITY X25519 keypair generated and stored in ${XPRO_KEYS}."
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 9  VIEW CLIENT CONFIG  (Menu option 3)
-# ─────────────────────────────────────────────────────────────────────────────
+reality_private_key() { jq -r '.private_key' "${XPRO_KEYS}"; }
+reality_public_key()  { jq -r '.public_key'  "${XPRO_KEYS}"; }
 
-view_client_config() {
-    print_banner
-    msg_step "OPTION 3 — View Client Configuration"
-
-    if ! is_xray_installed; then
-        msg_err "Xray is not installed. Please run Option 1 first."
-        press_enter; return
-    fi
-
-    if [[ ! -f "${DOMAIN_FILE}" ]] || [[ ! -f "${PATH_FILE}" ]] || [[ ! -f "${UPGRADE_PATH_FILE}" ]]; then
-        msg_err "Metadata files missing. Reinstall Xray (Option 1)."
-        press_enter; return
-    fi
-
-    local DOMAIN XHTTP_PATH UPGRADE_PATH
-    DOMAIN="$(cat "${DOMAIN_FILE}")"
-    XHTTP_PATH="$(cat "${PATH_FILE}")"
-    UPGRADE_PATH="$(cat "${UPGRADE_PATH_FILE}" 2>/dev/null || echo '/upgrade')"
-
-    local -a USERS
-    mapfile -t USERS < <(jq -r '.inbounds[0].settings.clients[].email' \
-                          "${CONFIG_FILE}" 2>/dev/null)
-
-    if [[ ${#USERS[@]} -eq 0 ]]; then
-        msg_err "No users found. Add users via Option 2 first."
-        press_enter; return
-    fi
-
-    echo -e "  ${WHITE}${BOLD}Registered users:${NC}"
-    echo ""
-    local i
-    for i in "${!USERS[@]}"; do
-        echo -e "  ${CYAN}  $((i+1)).${NC}  ${USERS[$i]}"
-    done
-    echo ""
-    echo -e "  ${YELLOW}Select user number [1-${#USERS[@]}]:${NC} "
-    read -r USER_NUM < /dev/tty
-
-    if ! [[ "${USER_NUM}" =~ ^[0-9]+$ ]] || \
-       [[ "${USER_NUM}" -lt 1 ]] || \
-       [[ "${USER_NUM}" -gt "${#USERS[@]}" ]]; then
-        msg_err "Invalid selection '${USER_NUM}'."
-        press_enter; return
-    fi
-
-    local SELECTED_USER USER_UUID
-    SELECTED_USER="${USERS[$((USER_NUM-1))]}"
-    USER_UUID="$(jq -r --arg em "${SELECTED_USER}" \
-        '.inbounds[0].settings.clients[] | select(.email == $em) | .id' \
-        "${CONFIG_FILE}")"
-
-    if [[ -z "${USER_UUID}" ]] || [[ "${USER_UUID}" == "null" ]]; then
-        msg_err "Could not retrieve UUID for '${SELECTED_USER}'."
-        press_enter; return
-    fi
-
-    local PATH_ENC
-    PATH_ENC="$(urlencode "${XHTTP_PATH}")"
-
-    # [A] XHTTP CDN Mode — client:443 (or CDN edge) → nginx:443 → grpc_pass → xhttp-inner
-    # mode=auto matches the server config: over TLS+H2 it negotiates to
-    # stream-up, which disguises frames with a gRPC Content-Type specifically
-    # so nginx's grpc_pass (and Cloudflare's gRPC feature) handle it correctly.
-    local CDN_URL
-    CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    CDN_URL+="?encryption=none&type=xhttp&mode=auto"
-    CDN_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
-    CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2"
-    CDN_URL+="#${SELECTED_USER}-XHTTP-CDN"
-
-    # [B] XHTTP Direct TLS — client connects straight to nginx:443 (no CDN)
-    local DIRECT_URL
-    DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    DIRECT_URL+="?encryption=none&type=xhttp&mode=auto"
-    DIRECT_URL+="&path=${PATH_ENC}&host=${DOMAIN}"
-    DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome&alpn=h2"
-    DIRECT_URL+="#${SELECTED_USER}-XHTTP-Direct-TLS"
-
-    local UPGRADE_ENC
-    UPGRADE_ENC="$(urlencode "${UPGRADE_PATH}")"
-
-    # [D] HTTP Upgrade CDN Mode — client:443 (or CDN edge) → nginx:443 → proxy_pass (Upgrade)
-    local UPGRADE_CDN_URL
-    UPGRADE_CDN_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    UPGRADE_CDN_URL+="?encryption=none&type=httpupgrade"
-    UPGRADE_CDN_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}"
-    UPGRADE_CDN_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
-    UPGRADE_CDN_URL+="#${SELECTED_USER}-Upgrade-CDN"
-
-    # [E] HTTP Upgrade Direct TLS — client connects straight to nginx:443 (no CDN)
-    local UPGRADE_DIRECT_URL
-    UPGRADE_DIRECT_URL="vless://${USER_UUID}@${DOMAIN}:443"
-    UPGRADE_DIRECT_URL+="?encryption=none&type=httpupgrade"
-    UPGRADE_DIRECT_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}"
-    UPGRADE_DIRECT_URL+="&security=tls&sni=${DOMAIN}&fp=chrome"
-    UPGRADE_DIRECT_URL+="#${SELECTED_USER}-Upgrade-Direct-TLS"
-
-    # [F] HTTP Upgrade NTLS — nginx:80, unencrypted — testing only
-    local UPGRADE_NTLS_URL
-    UPGRADE_NTLS_URL="vless://${USER_UUID}@${DOMAIN}:80"
-    UPGRADE_NTLS_URL+="?encryption=none&type=httpupgrade"
-    UPGRADE_NTLS_URL+="&path=${UPGRADE_ENC}&host=${DOMAIN}&security=none"
-    UPGRADE_NTLS_URL+="#${SELECTED_USER}-Upgrade-NTLS-TestOnly"
-
-    clear
-    echo ""
-    separator
-    echo -e "  ${WHITE}${BOLD}Client config for: ${CYAN}${SELECTED_USER}${NC}"
-    separator
-    echo -e "  ${WHITE}Domain    :${NC} ${DOMAIN}"
-    echo -e "  ${WHITE}UUID      :${NC} ${USER_UUID}"
-    echo -e "  ${WHITE}XHTTP Path  :${NC} ${XHTTP_PATH}"
-    echo -e "  ${WHITE}Upgrade Path:${NC} ${UPGRADE_PATH}"
-    echo ""
-
-    # ── [A] XHTTP CDN ─────────────────────────────────────────────────────────
-    separator
-    echo -e "  ${GREEN}${BOLD}[A]  XHTTP CDN MODE — Client:443 → CDN → nginx:443 → Xray${NC}"
-    echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
-    echo ""
-    echo -e "  ${WHITE}VLESS URL:${NC}"
-    echo -e "  ${CYAN}${CDN_URL}${NC}"
-    echo ""
-    if cmd_exists qrencode; then
-        echo -e "  ${WHITE}QR Code:${NC}"
-        echo ""
-        qrencode -t ANSIUTF8 -m 2 "${CDN_URL}"
-        echo ""
-    fi
-
-    # ── [B] XHTTP Direct TLS ──────────────────────────────────────────────────
-    separator
-    echo -e "  ${GREEN}${BOLD}[B]  XHTTP DIRECT TLS — Client:443 → nginx:443 (no CDN) → Xray${NC}"
-    echo -e "  ${YELLOW}Use when:${NC} DNS is grey-cloud / DNS-only (no CDN proxy)."
-    echo ""
-    echo -e "  ${WHITE}VLESS URL:${NC}"
-    echo -e "  ${CYAN}${DIRECT_URL}${NC}"
-    echo ""
-    if cmd_exists qrencode; then
-        echo -e "  ${WHITE}QR Code:${NC}"
-        echo ""
-        qrencode -t ANSIUTF8 -m 2 "${DIRECT_URL}"
-        echo ""
-    fi
-
-    # ── [C] HTTP Upgrade CDN ──────────────────────────────────────────────────
-    separator
-    echo -e "  ${GREEN}${BOLD}[C]  HTTP UPGRADE CDN MODE — Client:443 → CDN edge → nginx:443 → Xray${NC}"
-    echo -e "  ${YELLOW}Use when:${NC} Cloudflare/CDN orange-cloud proxy is enabled."
-    echo -e "  ${DIM}XHTTP is served on 443 ([A]/[B]) since TLS+H2 is what triggers its${NC}"
-    echo -e "  ${DIM}gRPC-disguise mode — recommended over the rarely-needed port-80 path.${NC}"
-    echo ""
-    echo -e "  ${WHITE}VLESS URL:${NC}"
-    echo -e "  ${CYAN}${UPGRADE_CDN_URL}${NC}"
-    echo ""
-    if cmd_exists qrencode; then
-        echo -e "  ${WHITE}QR Code:${NC}"
-        echo ""
-        qrencode -t ANSIUTF8 -m 2 "${UPGRADE_CDN_URL}"
-        echo ""
-    fi
-
-    # ── [D] HTTP Upgrade Direct TLS ───────────────────────────────────────────
-    separator
-    echo -e "  ${GREEN}${BOLD}[D]  HTTP UPGRADE DIRECT TLS — Client:443 → nginx:443 (no CDN) → Xray${NC}"
-    echo -e "  ${YELLOW}Use when:${NC} DNS is grey-cloud / DNS-only (no CDN proxy)."
-    echo ""
-    echo -e "  ${WHITE}VLESS URL:${NC}"
-    echo -e "  ${CYAN}${UPGRADE_DIRECT_URL}${NC}"
-    echo ""
-    if cmd_exists qrencode; then
-        echo -e "  ${WHITE}QR Code:${NC}"
-        echo ""
-        qrencode -t ANSIUTF8 -m 2 "${UPGRADE_DIRECT_URL}"
-        echo ""
-    fi
-
-    # ── [E] HTTP Upgrade NTLS ─────────────────────────────────────────────────
-    separator
-    echo -e "  ${MAGENTA}${BOLD}[E]  HTTP UPGRADE NTLS — nginx:80, unencrypted — TESTING ONLY${NC}"
-    echo -e "  ${RED}  ⚠  Do NOT use in production. Traffic is plain-text.${NC}"
-    echo ""
-    echo -e "  ${WHITE}VLESS URL:${NC}"
-    echo -e "  ${CYAN}${UPGRADE_NTLS_URL}${NC}"
-    echo ""
-    separator
-
-    echo ""
-    echo -e "  ${WHITE}Compatible clients:${NC}"
-    echo -e "   v2rayNG (Android) · Shadowrocket (iOS) · Hiddify"
-    echo -e "   Nekoray · Clash.Meta · Sing-box"
-    echo ""
-    press_enter
+gen_short_id() {
+    # 8-byte hex shortId, distinct per user (helps distinguish clients at the
+    # network level and lets you selectively invalidate one later if desired).
+    openssl rand -hex 8
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 10  CHECK STATUS  (Menu option 4)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Xray config.json generation & safe mutation
+# ---------------------------------------------------------------------------
+# All writes to config.json go through cfg_write(), which:
+#   1. Applies a jq filter to the current config into a temp file.
+#   2. Validates the result is well-formed JSON.
+#   3. Validates it with `xray run -test` (catches semantic errors jq can't
+#      see, e.g. a missing required field).
+#   4. Only then atomically replaces the live config.
+# If any step fails, the live config.json is left completely untouched.
+cfg_write() {
+    local filter="$1"
+    shift
+    local tmp
+    tmp="$(mktemp "${XRAY_ETC_DIR}/.config.XXXXXX.json")"
 
-check_status() {
-    print_banner
-    msg_step "OPTION 4 — System Status"
-
-    separator
-    echo ""
-
-    # [1] Service
-    echo -e "  ${WHITE}${BOLD}[ 1 ]  Xray Systemd Service${NC}"
-    echo ""
-    systemctl status xray --no-pager -l 2>/dev/null || \
-        echo -e "  ${RED}xray.service not found in systemd.${NC}"
-
-    echo ""
-    separator
-    echo ""
-
-    # [2] Ports
-    echo -e "  ${WHITE}${BOLD}[ 2 ]  Port Listening Status${NC}"
-    echo ""
-    local P80_INFO P443_INFO PXHTTP_INFO PUPGRADE_INFO NGINX_ACTIVE
-    P80_INFO="$(ss -tlnp 2>/dev/null | grep ':80 ' || echo '')"
-    P443_INFO="$(ss -tlnp 2>/dev/null | grep ':443 ' || echo '')"
-    PXHTTP_INFO="$(ss -tlnp 2>/dev/null | grep ":${PORT_XHTTP_INNER} " || echo '')"
-    PUPGRADE_INFO="$(ss -tlnp 2>/dev/null | grep ":${PORT_UPGRADE_INNER} " || echo '')"
-    NGINX_ACTIVE="$(systemctl is-active nginx 2>/dev/null || echo 'inactive')"
-
-    echo -e "  ${WHITE}${BOLD}Public (nginx):${NC}"
-    if [[ -n "${P80_INFO}" ]]; then
-        echo -e "  Port 80   (nginx, HTTP Upgrade, HTTP/1.1) : ${GREEN}${BOLD}● LISTENING${NC}"
-        echo -e "  ${DIM}  ${P80_INFO}${NC}"
-    else
-        echo -e "  Port 80   (nginx, HTTP Upgrade, HTTP/1.1) : ${RED}○ NOT LISTENING${NC}"
+    if ! jq "$@" "${filter}" "${XRAY_CONFIG}" >"${tmp}" 2>>"${XPRO_LOG}"; then
+        rm -f "${tmp}"
+        die "jq failed while updating ${XRAY_CONFIG} — no changes were made. See ${XPRO_LOG}."
+    fi
+    if ! jq -e . "${tmp}" >/dev/null 2>&1; then
+        rm -f "${tmp}"
+        die "Config update produced invalid JSON — aborting before overwrite."
+    fi
+    if ! "${XRAY_BIN}" run -test -config "${tmp}" >>"${XPRO_LOG}" 2>&1; then
+        rm -f "${tmp}"
+        die "Config update failed Xray's own validation (xray run -test) — aborting before overwrite. See ${XPRO_LOG}."
     fi
 
-    if [[ -n "${P443_INFO}" ]]; then
-        echo -e "  Port 443  (nginx, XHTTP+Upgrade TLS)  : ${GREEN}${BOLD}● LISTENING${NC}"
-        echo -e "  ${DIM}  ${P443_INFO}${NC}"
-    else
-        echo -e "  Port 443  (nginx, XHTTP+Upgrade TLS)  : ${RED}○ NOT LISTENING${NC}"
-    fi
-
-    if [[ "${NGINX_ACTIVE}" == "active" ]]; then
-        echo -e "  nginx service                         : ${GREEN}${BOLD}● ${NGINX_ACTIVE}${NC}"
-    else
-        echo -e "  nginx service                         : ${RED}○ ${NGINX_ACTIVE}${NC}"
-    fi
-
-    echo ""
-    echo -e "  ${WHITE}${BOLD}Internal (Xray, loopback-only — not exposed):${NC}"
-    if [[ -n "${PXHTTP_INFO}" ]]; then
-        echo -e "  Port ${PORT_XHTTP_INNER} (XHTTP inner)   : ${GREEN}${BOLD}● LISTENING${NC}"
-    else
-        echo -e "  Port ${PORT_XHTTP_INNER} (XHTTP inner)   : ${RED}○ NOT LISTENING${NC}"
-    fi
-
-    if [[ -n "${PUPGRADE_INFO}" ]]; then
-        echo -e "  Port ${PORT_UPGRADE_INNER} (Upgrade inner) : ${GREEN}${BOLD}● LISTENING${NC}"
-    else
-        echo -e "  Port ${PORT_UPGRADE_INNER} (Upgrade inner) : ${RED}○ NOT LISTENING${NC}"
-    fi
-
-    echo ""
-    separator
-    echo ""
-
-    # [3] Config summary
-    echo -e "  ${WHITE}${BOLD}[ 3 ]  Configuration Summary${NC}"
-    echo ""
-    if is_xray_installed; then
-        [[ -f "${DOMAIN_FILE}" ]]       && echo -e "  Domain        : ${WHITE}$(cat "${DOMAIN_FILE}")${NC}"
-        [[ -f "${PATH_FILE}" ]]         && echo -e "  XHTTP path    : ${WHITE}$(cat "${PATH_FILE}")${NC}"
-        [[ -f "${UPGRADE_PATH_FILE}" ]] && echo -e "  Upgrade path  : ${WHITE}$(cat "${UPGRADE_PATH_FILE}")${NC}"
-
-        local USER_COUNT
-        USER_COUNT="$(jq '.inbounds[0].settings.clients | length' \
-                     "${CONFIG_FILE}" 2>/dev/null || echo '0')"
-        echo -e "  Total users : ${WHITE}${USER_COUNT}${NC}"
-
-        if [[ "${USER_COUNT}" -gt 0 ]]; then
-            echo -e "  User list   :"
-            jq -r '.inbounds[0].settings.clients |
-                   to_entries[] |
-                   "    \(.key+1). \(.value.email)  [\(.value.id)]"' \
-               "${CONFIG_FILE}" 2>/dev/null
-        fi
-
-        if [[ -x "${XRAY_BIN}" ]]; then
-            local XRAY_VER
-            XRAY_VER="$("${XRAY_BIN}" version 2>/dev/null | head -n1 || echo 'unknown')"
-            echo -e "  Xray version: ${WHITE}${XRAY_VER}${NC}"
-        fi
-
-        # v2.3.0: show geo-data status
-        echo -e "  Geo-data dir: ${WHITE}${GEO_DIR}${NC}"
-        if [[ -s "${GEO_DIR}/geoip.dat" ]] && [[ -s "${GEO_DIR}/geosite.dat" ]]; then
-            local gip_sz gst_sz
-            gip_sz="$(du -sh "${GEO_DIR}/geoip.dat"   2>/dev/null | cut -f1)"
-            gst_sz="$(du -sh "${GEO_DIR}/geosite.dat" 2>/dev/null | cut -f1)"
-            echo -e "  geoip.dat   : ${GREEN}${gip_sz}${NC}"
-            echo -e "  geosite.dat : ${GREEN}${gst_sz}${NC}"
-        else
-            echo -e "  ${RED}Geo-data files MISSING — Xray will fail to start!${NC}"
-            echo -e "  Fix: ${WHITE}mkdir -p ${GEO_DIR} && bash $(realpath "$0")${NC}"
-        fi
-    else
-        echo -e "  ${RED}Xray is not installed on this system.${NC}"
-    fi
-
-    echo ""
-    separator
-    echo ""
-
-    # [4] SSL cert
-    echo -e "  ${WHITE}${BOLD}[ 4 ]  SSL Certificate${NC}"
-    echo ""
-    if [[ -f "${CERT_FULLCHAIN}" ]]; then
-        local CERT_EXPIRY CERT_CN
-        CERT_EXPIRY="$(openssl x509 -noout -enddate -in "${CERT_FULLCHAIN}" 2>/dev/null \
-                       | cut -d= -f2)"
-        CERT_CN="$(openssl x509 -noout -subject -in "${CERT_FULLCHAIN}" 2>/dev/null \
-                   | grep -oP 'CN\s*=\s*\K[^,/]+')"
-        echo -e "  File    : ${GREEN}Found${NC}  (${CERT_FULLCHAIN})"
-        echo -e "  CN / SAN: ${WHITE}${CERT_CN:-unknown}${NC}"
-        echo -e "  Expires : ${WHITE}${CERT_EXPIRY:-unknown}${NC}"
-        if openssl x509 -noout -checkend 2592000 -in "${CERT_FULLCHAIN}" &>/dev/null; then
-            echo -e "  Status  : ${GREEN}Valid — more than 30 days remaining${NC}"
-        else
-            echo -e "  Status  : ${YELLOW}Expires < 30 days — acme.sh will auto-renew${NC}"
-        fi
-    else
-        echo -e "  ${RED}Certificate not found at ${CERT_FULLCHAIN}.${NC}"
-        echo -e "  ${YELLOW}Reinstall (Option 1) to re-issue.${NC}"
-    fi
-
-    echo ""
-    separator
-    echo ""
-
-    # [5] Error log
-    echo -e "  ${WHITE}${BOLD}[ 5 ]  Recent Xray Error Log (last 15 lines)${NC}"
-    echo ""
-    if [[ -f "${LOG_DIR}/error.log" ]]; then
-        local LOG_LINES
-        LOG_LINES="$(tail -n 15 "${LOG_DIR}/error.log" 2>/dev/null)"
-        if [[ -z "${LOG_LINES}" ]]; then
-            echo -e "  ${GREEN}No errors logged. ✓${NC}"
-        else
-            while IFS= read -r line; do
-                echo -e "  ${DIM}${line}${NC}"
-            done <<< "${LOG_LINES}"
-        fi
-    else
-        echo -e "  ${DIM}Log not found: ${LOG_DIR}/error.log${NC}"
-    fi
-
-    echo ""
-    separator
-    press_enter
+    cp -p "${XRAY_CONFIG}" "${XPRO_BACKUP_DIR}/config.json.$(date +%s).bak" 2>/dev/null || true
+    chmod 644 "${tmp}"
+    mv -f "${tmp}" "${XRAY_CONFIG}"
+    find "${XPRO_BACKUP_DIR}" -maxdepth 1 -name 'config.json.*.bak' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | tail -n +21 | cut -d' ' -f2- | xargs -r rm -f
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 11  UNINSTALL  (Menu option 5)
-# ─────────────────────────────────────────────────────────────────────────────
+# Writes a brand-new base config with one VLESS/XTLS-Vision/REALITY inbound
+# and no clients yet. Clients are added afterwards via cfg_add_client so the
+# add-a-user code path is identical whether it's the 1st or 100th user.
+generate_base_config() {
+    local port="$1" dest="$2" sni="$3" private_key="$4"
+    install -d -m 755 "${XRAY_ETC_DIR}"
 
-uninstall_xray() {
-    print_banner
-    msg_step "OPTION 5 — Uninstall Xray-core"
+    jq -n \
+        --argjson port "${port}" \
+        --arg dest "${dest}" \
+        --arg sni "${sni}" \
+        --arg priv "${private_key}" \
+        '{
+            log: {
+                loglevel: "warning",
+                access: "'"${XRAY_LOG_DIR}"'/access.log",
+                error: "'"${XRAY_LOG_DIR}"'/error.log"
+            },
+            inbounds: [
+                {
+                    tag: "vless-reality-in",
+                    listen: "0.0.0.0",
+                    port: $port,
+                    protocol: "vless",
+                    settings: {
+                        clients: [],
+                        decryption: "none"
+                    },
+                    streamSettings: {
+                        network: "tcp",
+                        security: "reality",
+                        realitySettings: {
+                            show: false,
+                            dest: $dest,
+                            xver: 0,
+                            serverNames: [$sni],
+                            privateKey: $priv,
+                            shortIds: []
+                        }
+                    },
+                    sniffing: {
+                        enabled: true,
+                        destOverride: ["http", "tls", "quic"]
+                    }
+                }
+            ],
+            outbounds: [
+                { protocol: "freedom", tag: "direct" },
+                { protocol: "blackhole", tag: "block" }
+            ]
+        }' >"${XRAY_CONFIG}"
 
-    echo -e "  ${RED}${BOLD}This will PERMANENTLY remove Xray and all associated data.${NC}"
-    echo ""
-    echo -e "  Items that will be deleted:"
-    echo -e "   ${RED}→${NC}  Xray binary      : ${XRAY_BIN}"
-    echo -e "   ${RED}→${NC}  Configuration    : ${XRAY_CONFIG_DIR}/"
-    echo -e "   ${RED}→${NC}  Geo-data         : ${GEO_DIR}/"
-    echo -e "   ${RED}→${NC}  Log files        : ${LOG_DIR}/"
-    echo -e "   ${RED}→${NC}  SSL certificates : ${CERT_DIR}/"
-    echo -e "   ${RED}→${NC}  systemd service  : ${SERVICE_FILE}"
-    echo -e "   ${RED}→${NC}  UFW rules for ports 80 and 443"
-    echo ""
-
-    echo -e "  ${YELLOW}Also remove acme.sh and ALL its certificates? [y/N]:${NC} "
-    read -r RM_ACME < /dev/tty
-    echo ""
-    echo -e "  ${YELLOW}Type ${WHITE}CONFIRM${YELLOW} and press Enter to proceed:${NC} "
-    read -r UNINSTALL_WORD < /dev/tty
-    echo ""
-
-    if [[ "${UNINSTALL_WORD}" != "CONFIRM" ]]; then
-        msg_info "Uninstallation cancelled. Nothing was modified."
-        press_enter; return
-    fi
-
-    msg_step "Uninstalling..."
-
-    systemctl stop    xray  2>/dev/null && msg_ok "Xray service stopped."   || \
-        msg_warn "Xray service was not running."
-    systemctl disable xray  2>/dev/null && msg_ok "Xray service disabled."  || \
-        msg_warn "Xray service was not enabled."
-    systemctl stop    nginx 2>/dev/null && msg_ok "nginx stopped."          || \
-        msg_warn "nginx was not running."
-    systemctl disable nginx 2>/dev/null && msg_ok "nginx disabled."         || \
-        msg_warn "nginx was not enabled."
-
-    rm -f /etc/nginx/sites-enabled/xray-router \
-          /etc/nginx/sites-available/xray-router 2>/dev/null && \
-        msg_ok "Removed nginx xray-router config."
-
-    [[ -f "${SERVICE_FILE}" ]]    && rm -f  "${SERVICE_FILE}"    && msg_ok "Removed: ${SERVICE_FILE}"
-    [[ -f "${XRAY_BIN}" ]]        && rm -f  "${XRAY_BIN}"        && msg_ok "Removed: ${XRAY_BIN}"
-    [[ -d "${XRAY_CONFIG_DIR}" ]] && rm -rf "${XRAY_CONFIG_DIR}" && msg_ok "Removed: ${XRAY_CONFIG_DIR}"
-    [[ -d "${GEO_DIR}" ]]         && rm -rf "${GEO_DIR}"         && msg_ok "Removed: ${GEO_DIR}"
-    [[ -d "${LOG_DIR}" ]]         && rm -rf "${LOG_DIR}"         && msg_ok "Removed: ${LOG_DIR}"
-    [[ -d "${CERT_DIR}" ]]        && rm -rf "${CERT_DIR}"        && msg_ok "Removed: ${CERT_DIR}"
-    rm -f "${INSTALL_LOG}"
-
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl reset-failed  2>/dev/null || true
-    msg_ok "systemd reloaded."
-
-    if cmd_exists ufw; then
-        ufw delete allow 80/tcp  2>/dev/null && msg_ok "Removed UFW rule: 80."  || true
-        ufw delete allow 443/tcp 2>/dev/null && msg_ok "Removed UFW rule: 443." || true
-    fi
-
-    if [[ "${RM_ACME,,}" == "y" ]]; then
-        if [[ -f "${ACME_BIN}" ]]; then
-            msg_info "Uninstalling acme.sh..."
-            "${ACME_BIN}" --uninstall >>"${INSTALL_LOG}" 2>&1 || true
-            rm -rf "${ACME_HOME}"
-            msg_ok "acme.sh removed."
-        else
-            msg_warn "acme.sh not found. Skipping."
-        fi
-        if crontab -l 2>/dev/null | grep -q 'acme.sh'; then
-            crontab -l 2>/dev/null | grep -v 'acme.sh' | crontab -
-            msg_ok "acme.sh cron entries removed."
-        fi
-    else
-        msg_info "Keeping acme.sh."
-    fi
-
-    echo ""
-    separator
-    echo -e "  ${GREEN}${BOLD}Xray-core has been completely uninstalled.${NC}"
-    echo ""
-    echo -e "  System is back to its pre-installation state."
-    echo -e "  To remove leftover apt packages: ${WHITE}sudo apt-get autoremove${NC}"
-    echo ""
-    separator
-    press_enter
+    chmod 644 "${XRAY_CONFIG}"
+    ok "Base Xray config written to ${XRAY_CONFIG} (port ${port}, SNI ${sni})."
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 12  MAIN MENU
-# ─────────────────────────────────────────────────────────────────────────────
-
-show_menu() {
-    print_banner
-    echo -e "  ${WHITE}${BOLD}Select an option:${NC}"
-    echo ""
-    echo -e "  ${CYAN}  1.${NC}  ${GREEN}Install Xray-core${NC} (XHTTP + CDN Optimised)"
-    echo -e "         ${DIM}Install Xray: VLESS+XHTTP on :443, HTTP Upgrade on :80 and :443${NC}"
-    echo ""
-    echo -e "  ${CYAN}  2.${NC}  ${GREEN}Add User${NC}"
-    echo -e "         ${DIM}Generate a UUID and add a new VLESS user${NC}"
-    echo ""
-    echo -e "  ${CYAN}  3.${NC}  ${GREEN}View Client Config${NC}"
-    echo -e "         ${DIM}Show VLESS URLs and QR codes for all modes${NC}"
-    echo ""
-    echo -e "  ${CYAN}  4.${NC}  ${GREEN}Check Status${NC}"
-    echo -e "         ${DIM}Service state, ports, users, cert expiry, logs${NC}"
-    echo ""
-    echo -e "  ${CYAN}  5.${NC}  ${RED}Uninstall${NC}"
-    echo -e "         ${DIM}Completely remove Xray, configs, certs, service${NC}"
-    echo ""
-    echo -e "  ${CYAN}  6.${NC}  Exit"
-    echo ""
-    separator
-    echo ""
-    echo -e "  ${YELLOW}Enter choice [1-6]:${NC} "
-    read -r MENU_CHOICE < /dev/tty
+# Adds one client to the single inbound's clients[] AND its shortId to
+# shortIds[]. email is set to the username purely for human-readable
+# `xray api` / log correlation — it is NEVER used to store expiry.
+cfg_add_client() {
+    local username="$1" uuid="$2" short_id="$3"
+    cfg_write '(.inbounds[0].settings.clients) += [{
+            id: $uuid,
+            flow: "xtls-rprx-vision",
+            email: $username
+        }]
+        | (.inbounds[0].streamSettings.realitySettings.shortIds) += [$sid]' \
+        --arg username "${username}" \
+        --arg uuid "${uuid}" \
+        --arg sid "${short_id}"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# § 13  ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+# Removes a client by username (email field) and its shortId. We look up the
+# shortId from the DB (not the config) before calling this, then strip both
+# in one jq pass so config.json never has an orphaned shortId hanging around
+# unrelated to any live client.
+cfg_remove_client() {
+    local username="$1" short_id="$2"
+    cfg_write '(.inbounds[0].settings.clients) |= map(select(.email != $username))
+        | (.inbounds[0].streamSettings.realitySettings.shortIds) |= map(select(. != $sid))' \
+        --arg username "${username}" \
+        --arg sid "${short_id}"
+}
 
-main() {
-    # Force a sane TERM for Android SSH apps (JuiceSSH, ConnectBot, Termius).
-    export TERM="${TERM:-xterm-256color}"
+cfg_client_exists() {
+    local username="$1"
+    jq -e --arg u "${username}" '.inbounds[0].settings.clients[] | select(.email == $u)' \
+        "${XRAY_CONFIG}" >/dev/null 2>&1
+}
 
-    # Rewire stdin to the real TTY device. This is the definitive fix for
-    # Android SSH apps that break 'read' inside functions after 'clear'.
-    # Every 'read' call also explicitly uses '< /dev/tty' as backup.
-    exec 0</dev/tty
+# ---------------------------------------------------------------------------
+# Public IP detection & VLESS share-link construction
+# ---------------------------------------------------------------------------
+detect_public_ip() {
+    local ip
+    ip="$(curl -fsSL4 --max-time 5 https://api.ipify.org 2>/dev/null)"
+    if [[ -z "${ip}" ]]; then
+        ip="$(curl -fsSL4 --max-time 5 https://ifconfig.me 2>/dev/null)"
+    fi
+    if [[ -z "${ip}" ]]; then
+        warn "Could not auto-detect public IP. Falling back to first non-loopback address."
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    echo "${ip}"
+}
 
-    check_root
-    check_ubuntu_2404
-
-    mkdir -p "$(dirname "${INSTALL_LOG}")" 2>/dev/null || true
-
-    while true; do
-        show_menu
-        case "${MENU_CHOICE}" in
-            1) install_xray       ;;
-            2) add_user           ;;
-            3) view_client_config ;;
-            4) check_status       ;;
-            5) uninstall_xray     ;;
-            6)
-                echo ""
-                echo -e "  ${GREEN}Goodbye.${NC}"
-                echo ""
-                exit 0
-                ;;
-            *)
-                msg_err "Invalid choice '${MENU_CHOICE}'. Enter a number from 1 to 6."
-                sleep 1
-                ;;
+# Builds a vless:// URI per the informal but widely-adopted VLESS URI scheme
+# used by Xray/V2Ray clients. Query params are URL-encoded where it matters
+# (username in the fragment is the one field likely to contain spaces).
+urlencode() {
+    # Pure-bash percent-encoding — deliberately avoids depending on python3
+    # (not guaranteed present on a minimal Ubuntu server image) or a
+    # jq @uri filter version quirk. Only used for the link's fragment
+    # (the username label), so this only needs to be correct, not fast.
+    local s="$1" out="" c i
+    for (( i=0; i<${#s}; i++ )); do
+        c="${s:i:1}"
+        case "${c}" in
+            [a-zA-Z0-9.~_-]) out+="${c}" ;;
+            *) out+="$(printf '%%%02X' "'${c}")" ;;
         esac
     done
+    echo "${out}"
+}
+
+build_vless_link() {
+    local username="$1" uuid="$2" server_ip="$3" port="$4" sni="$5" pubkey="$6" short_id="$7"
+    local frag
+    frag="$(urlencode "${username}")"
+
+    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp&headerType=none#%s\n' \
+        "${uuid}" "${server_ip}" "${port}" "${sni}" "${pubkey}" "${short_id}" "${frag}"
+}
+
+# Displays a link both as text and (if qrencode is available, which we
+# install as a dependency) as a terminal-rendered QR code for quick mobile
+# scanning. Always shown outside dialog (plain stdout) since dialog's text
+# boxes mangle wide QR output and scrollback is more useful here anyway.
+show_link_and_qr() {
+    local link="$1"
+    echo
+    echo -e "${C_BOLD}VLESS connection link:${C_RESET}"
+    echo "${link}"
+    echo
+    if command -v qrencode >/dev/null 2>&1; then
+        echo -e "${C_BOLD}QR code:${C_RESET}"
+        qrencode -t ANSIUTF8 "${link}"
+        echo
+    else
+        warn "qrencode not available — showing link text only."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Input validation
+# ---------------------------------------------------------------------------
+# Username rules: 3-32 chars, alnum + underscore/hyphen, must start with a
+# letter. Kept restrictive on purpose — this value is used as a jq --arg
+# match key, an Xray "email" field, and a URI fragment, so keeping it to a
+# safe character set sidesteps a whole class of escaping bugs rather than
+# trying to escape every consumer perfectly.
+valid_username() {
+    [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9_-]{2,31}$ ]]
+}
+
+valid_days() {
+    # Positive integer, reasonable upper bound (10 years) to catch fat-finger
+    # entry like an extra zero turning 30 days into 300 years.
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 3650 ))
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+# now / date-math helpers, all UTC, all ISO 8601 — one format used
+# everywhere (DB, comparisons, display) so string comparison in jq
+# (.expires_at < $now) is always correct without parsing.
+now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+expiry_from_days() {
+    local days="$1"
+    date -u -d "+${days} days" +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+extend_expiry() {
+    local current_iso="$1" days="$2" base
+    # If already expired, extend from *now* rather than compounding onto a
+    # past date — otherwise "extend a 3-month-expired account by 7 days"
+    # would still leave it expired, which is almost never the intent.
+    if [[ "${current_iso}" < "$(now_iso)" ]]; then
+        base="now"
+    else
+        base="${current_iso}"
+    fi
+    date -u -d "${base} +${days} days" +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+human_date() {
+    date -u -d "$1" +"%Y-%m-%d %H:%M UTC" 2>/dev/null || echo "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: Create Account
+# ---------------------------------------------------------------------------
+action_create_account() {
+    local username days uuid short_id created_at expires_at server_ip port sni pubkey link
+    local answer
+
+    answer="$(dlg --title "Create Account" --inputbox "Enter a username (3-32 chars, letters/numbers/_/- , must start with a letter):" 10 70 3>&1 1>&2 2>&3)" \
+        || { info "Create Account cancelled."; return; }
+    username="${answer}"
+
+    if [[ -z "${username}" ]]; then
+        dlg --title "Error" --msgbox "Username cannot be empty." 8 50
+        return
+    fi
+    if ! valid_username "${username}"; then
+        dlg --title "Invalid username" --msgbox "Username must be 3-32 characters, start with a letter, and contain only letters, numbers, underscore, or hyphen." 9 70
+        return
+    fi
+    # Block duplicates against BOTH the DB and the live config — belt and
+    # braces in case they've ever drifted apart (e.g. manual config edits).
+    if db_user_exists "${username}"; then
+        dlg --title "Duplicate username" --msgbox "A user named '${username}' already exists in the database. Choose a different name, or use Extend/Delete instead." 9 70
+        return
+    fi
+    if cfg_client_exists "${username}"; then
+        dlg --title "Duplicate username" --msgbox "A client with email '${username}' already exists in the live Xray config even though it's not in the database. Refusing to create a duplicate — please investigate ${XRAY_CONFIG} manually." 10 70
+        return
+    fi
+
+    answer="$(dlg --title "Create Account" --inputbox "Duration in days (1-3650):" 10 60 "30" 3>&1 1>&2 2>&3)" \
+        || { info "Create Account cancelled."; return; }
+    days="${answer}"
+
+    if ! valid_days "${days}"; then
+        dlg --title "Invalid duration" --msgbox "Duration must be a whole number of days between 1 and 3650." 8 60
+        return
+    fi
+
+    uuid="$(uuidgen)"
+    short_id="$(gen_short_id)"
+    created_at="$(now_iso)"
+    expires_at="$(expiry_from_days "${days}")"
+
+    # --- Apply to Xray config first, DB second. If the config write fails
+    # (e.g. validation error), we bail out BEFORE touching the DB, so we
+    # never end up with a DB row for a user who was never actually granted
+    # access. cfg_add_client calls die() on failure, which exits the whole
+    # script — acceptable here since a config write failure means something
+    # is structurally wrong and continuing the TUI would be misleading.
+    info "Adding client '${username}' to Xray config..."
+    cfg_add_client "${username}" "${uuid}" "${short_id}"
+
+    info "Recording '${username}' in local database (expires ${expires_at})..."
+    db_add_user "${username}" "${uuid}" "${short_id}" "${created_at}" "${expires_at}"
+
+    if ! restart_xray; then
+        dlg --title "Warning" --msgbox "Account was created, but xray.service failed to restart cleanly. It will likely pick up the change on the next successful restart. Check: journalctl -u xray -n 50" 10 70
+    fi
+
+    server_ip="$(detect_public_ip)"
+    port="$(jq -r '.inbounds[0].port' "${XRAY_CONFIG}")"
+    sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "${XRAY_CONFIG}")"
+    pubkey="$(reality_public_key)"
+    link="$(build_vless_link "${username}" "${uuid}" "${server_ip}" "${port}" "${sni}" "${pubkey}" "${short_id}")"
+
+    dlg --title "Account Created" --msgbox "User '${username}' created successfully.\n\nExpires: $(human_date "${expires_at}")\n\nThe VLESS link and QR code will be printed to the terminal after you close this dialog." 12 70
+
+    # Drop out of the dialog UI to plain stdout for the link + QR, since QR
+    # rendering needs real terminal width/scrollback that dialog boxes don't
+    # give us cleanly.
+    clear
+    echo -e "${C_GREEN}${C_BOLD}Account '${username}' created.${C_RESET}"
+    echo "  UUID:       ${uuid}"
+    echo "  Short ID:   ${short_id}"
+    echo "  Created:    $(human_date "${created_at}")"
+    echo "  Expires:    $(human_date "${expires_at}")"
+    show_link_and_qr "${link}"
+    pause
+}
+
+# ---------------------------------------------------------------------------
+# Shared helper: build a dialog --menu of existing users, return the chosen
+# username on stdout (empty string / non-zero exit if cancelled or no users).
+# ---------------------------------------------------------------------------
+pick_user() {
+    local title="$1"
+    local -a menu_items=()
+    local username expires_at enabled status line
+
+    if [[ ! -s "${XPRO_DB}" ]] || [[ "$(jq '.users | length' "${XPRO_DB}")" -eq 0 ]]; then
+        dlg --title "${title}" --msgbox "No accounts exist yet. Use 'Create Account' first." 8 60
+        return 1
+    fi
+
+    while IFS=$'\t' read -r username expires_at enabled; do
+        if [[ "${enabled}" == "true" ]]; then
+            if [[ "${expires_at}" < "$(now_iso)" ]]; then
+                status="expired, pending sweep"
+            else
+                status="active until $(human_date "${expires_at}")"
+            fi
+        else
+            status="disabled/expired"
+        fi
+        menu_items+=("${username}" "${status}")
+    done < <(db_list_users)
+
+    if [[ "${#menu_items[@]}" -eq 0 ]]; then
+        dlg --title "${title}" --msgbox "No accounts found." 8 50
+        return 1
+    fi
+
+    line="$(dlg --title "${title}" --menu "Select an account:" 20 78 12 "${menu_items[@]}" 3>&1 1>&2 2>&3)" \
+        || return 1
+    echo "${line}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: Delete Account
+# ---------------------------------------------------------------------------
+action_delete_account() {
+    local username short_id
+
+    username="$(pick_user "Delete Account")" || { info "Delete Account cancelled."; return; }
+
+    if ! dlg --title "Confirm Delete" --yesno "Delete account '${username}'?\n\nThis removes them from the Xray config AND the local database. This cannot be undone (though a backup of both files is kept in ${XPRO_BACKUP_DIR})." 11 72; then
+        info "Delete Account cancelled by operator."
+        return
+    fi
+
+    short_id="$(db_get_user_field "${username}" "short_id")"
+
+    # Remove from config first (same ordering rationale as create: never let
+    # the DB and config disagree about who currently has access). If this
+    # step fails, cfg_remove_client's cfg_write will die() before we touch
+    # the DB, so the DB and config both still agree (both still list the
+    # user) rather than disagreeing in a new way.
+    if cfg_client_exists "${username}"; then
+        info "Removing '${username}' from Xray config..."
+        cfg_remove_client "${username}" "${short_id}"
+    else
+        warn "User '${username}' was not present in the live Xray config (already removed or never synced) — removing DB record only."
+    fi
+
+    db_remove_user "${username}"
+
+    if ! restart_xray; then
+        dlg --title "Warning" --msgbox "Account deleted from config and database, but xray.service failed to restart cleanly. Check: journalctl -u xray -n 50" 9 70
+    else
+        dlg --title "Deleted" --msgbox "Account '${username}' has been deleted and xray.service restarted." 8 60
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: Extend Account
+# ---------------------------------------------------------------------------
+action_extend_account() {
+    local username current_expiry days new_expiry answer was_disabled uuid short_id
+
+    username="$(pick_user "Extend Account")" || { info "Extend Account cancelled."; return; }
+
+    current_expiry="$(db_get_user_field "${username}" "expires_at")"
+    was_disabled="$(db_get_user_field "${username}" "enabled")"
+
+    answer="$(dlg --title "Extend Account" --inputbox "Current expiry for '${username}': $(human_date "${current_expiry}")\n\nDays to ADD:" 11 70 "30" 3>&1 1>&2 2>&3)" \
+        || { info "Extend Account cancelled."; return; }
+    days="${answer}"
+
+    if ! valid_days "${days}"; then
+        dlg --title "Invalid duration" --msgbox "Duration must be a whole number of days between 1 and 3650." 8 60
+        return
+    fi
+
+    new_expiry="$(extend_expiry "${current_expiry}" "${days}")"
+    db_extend_user "${username}" "${new_expiry}"
+
+    # If the account had already been swept (disabled + removed from config
+    # by the expiry job), extending it should also RE-ENABLE it — otherwise
+    # "extend" on an expired account would silently do nothing until the
+    # next manual re-creation, which isn't what an operator asking to
+    # extend an expired account wants.
+    if [[ "${was_disabled}" == "false" ]]; then
+        info "Account was previously expired/disabled — re-adding to Xray config..."
+        uuid="$(db_get_user_field "${username}" "uuid")"
+        short_id="$(db_get_user_field "${username}" "short_id")"
+        if ! cfg_client_exists "${username}"; then
+            cfg_add_client "${username}" "${uuid}" "${short_id}"
+        fi
+        db_set_enabled "${username}" "true"
+        restart_xray || dlg --title "Warning" --msgbox "Expiry extended and account re-enabled, but xray.service failed to restart. Check: journalctl -u xray -n 50" 9 70
+    fi
+
+    dlg --title "Extended" --msgbox "Account '${username}' extended.\n\nNew expiry: $(human_date "${new_expiry}")" 9 60
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: List Accounts (read-only overview)
+# ---------------------------------------------------------------------------
+action_list_accounts() {
+    local username expires_at enabled body status
+
+    if [[ "$(jq '.users | length' "${XPRO_DB}")" -eq 0 ]]; then
+        dlg --title "Accounts" --msgbox "No accounts exist yet." 8 50
+        return
+    fi
+
+    body=""
+    while IFS=$'\t' read -r username expires_at enabled; do
+        if [[ "${enabled}" == "true" ]]; then
+            if [[ "${expires_at}" < "$(now_iso)" ]]; then
+                status="EXPIRED (pending sweep)"
+            else
+                status="active"
+            fi
+        else
+            status="disabled"
+        fi
+        body+="$(printf '%-24s %-10s %s\n' "${username}" "${status}" "$(human_date "${expires_at}")")"$'\n'
+    done < <(db_list_users)
+
+    dlg --title "All Accounts" --msgbox "$(printf '%-24s %-10s %s\n\n' 'USERNAME' 'STATUS' 'EXPIRES')${body}" 22 78
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: Show Account Link (re-display an existing account's VLESS
+# link/QR without needing to recreate it — useful if a client lost their
+# config). Not explicitly called out as a separate top-level requirement,
+# but directly implied by "print the resulting VLESS link/QR data" — the
+# operator will want to reprint this later too.
+# ---------------------------------------------------------------------------
+action_show_link() {
+    local username uuid short_id server_ip port sni pubkey link
+
+    username="$(pick_user "Show Account Link")" || { info "Show Account Link cancelled."; return; }
+
+    if ! cfg_client_exists "${username}"; then
+        dlg --title "Not active" --msgbox "'${username}' is not currently present in the live Xray config (expired/disabled). Use Extend Account to re-enable them first." 9 70
+        return
+    fi
+
+    uuid="$(db_get_user_field "${username}" "uuid")"
+    short_id="$(db_get_user_field "${username}" "short_id")"
+    server_ip="$(detect_public_ip)"
+    port="$(jq -r '.inbounds[0].port' "${XRAY_CONFIG}")"
+    sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "${XRAY_CONFIG}")"
+    pubkey="$(reality_public_key)"
+    link="$(build_vless_link "${username}" "${uuid}" "${server_ip}" "${port}" "${sni}" "${pubkey}" "${short_id}")"
+
+    clear
+    echo -e "${C_GREEN}${C_BOLD}Connection details for '${username}':${C_RESET}"
+    show_link_and_qr "${link}"
+    pause
+}
+
+# ---------------------------------------------------------------------------
+# Expiry sweep: standalone script + systemd timer (with cron fallback)
+# ---------------------------------------------------------------------------
+# The sweep runs as its OWN script file, not as "xpro.sh --sweep", so that:
+#   - It has zero dependency on dialog/whiptail (it must run unattended,
+#     non-interactively, at 3am with nobody watching).
+#   - It can be inspected/audited independently of the interactive tool.
+#   - An `Update Script` on xpro.sh can't accidentally change sweep behavior
+#     mid-flight without a corresponding, deliberate regeneration step.
+write_sweep_script() {
+    install -d -m 700 "${XPRO_HOME}"
+    cat >"${XPRO_SWEEP_SCRIPT}" <<'SWEEP_EOF'
+#!/usr/bin/env bash
+# Auto-generated by xpro.sh — daily expiry sweep.
+# Do not edit directly; re-run xpro.sh's installer to regenerate this file.
+set -uo pipefail
+
+XRAY_BIN="__XRAY_BIN__"
+XRAY_CONFIG="__XRAY_CONFIG__"
+XPRO_HOME="__XPRO_HOME__"
+XPRO_DB="__XPRO_DB__"
+XPRO_LOG="__XPRO_LOG__"
+XPRO_BACKUP_DIR="__XPRO_BACKUP_DIR__"
+
+log() { printf '[%s] [SWEEP] %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$1" >>"${XPRO_LOG}"; }
+
+now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+if [[ ! -f "${XPRO_DB}" ]]; then
+    log "No database at ${XPRO_DB} — nothing to sweep."
+    exit 0
+fi
+if ! jq -e . "${XPRO_DB}" >/dev/null 2>&1; then
+    log "ERROR: ${XPRO_DB} is not valid JSON — refusing to sweep against a corrupt database."
+    exit 1
+fi
+
+mapfile -t expired_users < <(jq -r --arg now "${now}" \
+    '.users[] | select(.enabled == true and .expires_at < $now) | .username' "${XPRO_DB}")
+
+if [[ "${#expired_users[@]}" -eq 0 ]]; then
+    log "No expired accounts found. Nothing to do."
+    exit 0
+fi
+
+log "Found ${#expired_users[@]} expired account(s): ${expired_users[*]}"
+
+# Build the jq filter to remove ALL expired users' clients + shortIds from
+# the live config in a single pass (one restart instead of N restarts).
+config_tmp="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.XXXXXX.json")"
+usernames_json="$(printf '%s\n' "${expired_users[@]}" | jq -R . | jq -s .)"
+
+if ! jq --argjson names "${usernames_json}" '
+        (.inbounds[0].settings.clients) |= map(select((.email as $e | $names | index($e)) | not))
+    ' "${XRAY_CONFIG}" >"${config_tmp}" 2>>"${XPRO_LOG}"; then
+    log "ERROR: jq failed while stripping expired clients from config — aborting sweep, config untouched."
+    rm -f "${config_tmp}"
+    exit 1
+fi
+
+# Also strip shortIds belonging ONLY to expired users. We look each one up
+# from the DB (source of truth) rather than trying to infer it from the
+# config, since the DB is guaranteed to have it recorded at creation time.
+short_ids_to_remove="$(jq -r --argjson names "${usernames_json}" \
+    '.users[] | select(.username as $u | $names | index($u)) | .short_id' "${XPRO_DB}" | jq -R . | jq -s .)"
+
+config_tmp2="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.XXXXXX.json")"
+if ! jq --argjson sids "${short_ids_to_remove}" \
+    '(.inbounds[0].streamSettings.realitySettings.shortIds) |= map(select((. as $s | $sids | index($s)) | not))' \
+    "${config_tmp}" >"${config_tmp2}" 2>>"${XPRO_LOG}"; then
+    log "ERROR: jq failed while stripping expired shortIds — aborting sweep, config untouched."
+    rm -f "${config_tmp}" "${config_tmp2}"
+    exit 1
+fi
+rm -f "${config_tmp}"
+
+if ! jq -e . "${config_tmp2}" >/dev/null 2>&1; then
+    log "ERROR: post-sweep config is not valid JSON — aborting, config untouched."
+    rm -f "${config_tmp2}"
+    exit 1
+fi
+if ! "${XRAY_BIN}" run -test -config "${config_tmp2}" >>"${XPRO_LOG}" 2>&1; then
+    log "ERROR: post-sweep config failed 'xray run -test' — aborting, config untouched."
+    rm -f "${config_tmp2}"
+    exit 1
+fi
+
+cp -p "${XRAY_CONFIG}" "${XPRO_BACKUP_DIR}/config.json.$(date +%s).bak" 2>/dev/null || true
+mv -f "${config_tmp2}" "${XRAY_CONFIG}"
+chmod 644 "${XRAY_CONFIG}"
+
+# Mark each swept user as disabled in the DB (row is kept for history / to
+# allow Extend to resurrect them later — see action_extend_account).
+db_tmp="$(mktemp "${XPRO_HOME}/.db.XXXXXX.json")"
+if jq --argjson names "${usernames_json}" \
+    '.users |= map(if (.username as $u | $names | index($u)) then .enabled = false else . end)' \
+    "${XPRO_DB}" >"${db_tmp}" 2>>"${XPRO_LOG}" && jq -e . "${db_tmp}" >/dev/null 2>&1; then
+    cp -p "${XPRO_DB}" "${XPRO_BACKUP_DIR}/db.json.$(date +%s).bak" 2>/dev/null || true
+    mv -f "${db_tmp}" "${XPRO_DB}"
+    chmod 600 "${XPRO_DB}"
+else
+    log "ERROR: failed to update database after config sweep — config was updated but DB was NOT. Manual reconciliation needed."
+    rm -f "${db_tmp}"
+    exit 1
+fi
+
+if systemctl restart xray >>"${XPRO_LOG}" 2>&1; then
+    log "xray.service restarted successfully after sweeping ${#expired_users[@]} account(s)."
+else
+    log "ERROR: xray.service failed to restart after sweep. Check: journalctl -u xray -n 50"
+    exit 1
+fi
+
+log "Sweep complete."
+exit 0
+SWEEP_EOF
+
+    # Substitute real paths into the placeholders above (kept as literal
+    # __TOKENS__ in the heredoc so the sweep script is self-contained and
+    # doesn't need to source xpro.sh's variables at runtime).
+    sed -i \
+        -e "s#__XRAY_BIN__#${XRAY_BIN}#g" \
+        -e "s#__XRAY_CONFIG__#${XRAY_CONFIG}#g" \
+        -e "s#__XPRO_HOME__#${XPRO_HOME}#g" \
+        -e "s#__XPRO_DB__#${XPRO_DB}#g" \
+        -e "s#__XPRO_LOG__#${XPRO_LOG}#g" \
+        -e "s#__XPRO_BACKUP_DIR__#${XPRO_BACKUP_DIR}#g" \
+        "${XPRO_SWEEP_SCRIPT}"
+
+    chmod 700 "${XPRO_SWEEP_SCRIPT}"
+    ok "Expiry sweep script written to ${XPRO_SWEEP_SCRIPT}."
+}
+
+install_sweep_scheduler() {
+    write_sweep_script
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        info "Installing systemd timer for daily expiry sweep..."
+        cat >"${XPRO_SYSTEMD_SERVICE}" <<EOF
+[Unit]
+Description=xpro daily Xray account expiry sweep
+Documentation=${XPRO_REPO}
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=${XPRO_SWEEP_SCRIPT}
+EOF
+        cat >"${XPRO_SYSTEMD_TIMER}" <<EOF
+[Unit]
+Description=Run xpro expiry sweep daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now xpro-sweep.timer >/dev/null 2>&1
+        ok "systemd timer xpro-sweep.timer enabled (runs daily ~03:30 UTC, persistent across reboots)."
+    else
+        warn "systemd not detected/active — falling back to a cron.d entry instead."
+        cat >"${XPRO_CRON_FALLBACK}" <<EOF
+# Managed by xpro.sh — daily Xray account expiry sweep.
+30 3 * * * root ${XPRO_SWEEP_SCRIPT} >>${XPRO_LOG} 2>&1
+EOF
+        chmod 644 "${XPRO_CRON_FALLBACK}"
+        ok "cron.d entry installed at ${XPRO_CRON_FALLBACK} (runs daily at 03:30 server time)."
+    fi
+}
+
+remove_sweep_scheduler() {
+    if systemctl list-unit-files 2>/dev/null | grep -q '^xpro-sweep.timer'; then
+        systemctl disable --now xpro-sweep.timer >/dev/null 2>&1 || true
+    fi
+    rm -f "${XPRO_SYSTEMD_SERVICE}" "${XPRO_SYSTEMD_TIMER}" "${XPRO_CRON_FALLBACK}"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: Update Script
+# ---------------------------------------------------------------------------
+# Fetches the raw script from XPRO_RAW_URL (placeholder — point this at your
+# actual fork/repo's raw file URL before relying on this feature) and, after
+# operator confirmation, atomically replaces the currently-running script
+# file and re-execs it so the new version takes over immediately.
+action_update_script() {
+    local tmp_file remote_version current_hash remote_hash
+
+    info "Checking for updates from ${XPRO_RAW_URL} ..."
+    tmp_file="$(mktemp)"
+
+    if ! curl -fsSL --max-time 15 -o "${tmp_file}" "${XPRO_RAW_URL}"; then
+        rm -f "${tmp_file}"
+        dlg --title "Update failed" --msgbox "Could not download the latest script from:\n${XPRO_RAW_URL}\n\nCheck your network connection and that the URL/repo is correct (this ships with a placeholder URL — update XPRO_RAW_URL at the top of the script to point at your real fork)." 13 76
+        return
+    fi
+
+    # Sanity check: make sure we actually got a bash script, not e.g. a
+    # GitHub 404 HTML page or an empty response, before going any further.
+    if ! head -n1 "${tmp_file}" | grep -qE '^#!.*(bash|sh)'; then
+        rm -f "${tmp_file}"
+        dlg --title "Update failed" --msgbox "The downloaded file doesn't look like a shell script (missing #! shebang). Aborting update — nothing was changed. This usually means the URL returned an error page instead of the script." 10 74
+        return
+    fi
+    if ! bash -n "${tmp_file}" 2>>"${XPRO_LOG}"; then
+        rm -f "${tmp_file}"
+        dlg --title "Update failed" --msgbox "The downloaded script failed a bash syntax check (bash -n). Aborting update — nothing was changed. See ${XPRO_LOG} for details." 10 70
+        return
+    fi
+
+    current_hash="$(sha256sum "${XPRO_SELF_PATH}" 2>/dev/null | awk '{print $1}')"
+    remote_hash="$(sha256sum "${tmp_file}" | awk '{print $1}')"
+
+    if [[ "${current_hash}" == "${remote_hash}" ]]; then
+        rm -f "${tmp_file}"
+        dlg --title "Already up to date" --msgbox "The remote script is identical to the one currently running. Nothing to update." 8 66
+        return
+    fi
+
+    remote_version="$(grep -m1 -oE 'XPRO_VERSION="[^"]+"' "${tmp_file}" | cut -d'"' -f2)"
+
+    if ! dlg --title "Confirm Update" --yesno "A different version of xpro is available:\n\n  Current version:  ${XPRO_VERSION}\n  Remote version:   ${remote_version:-unknown}\n  Source:           ${XPRO_RAW_URL}\n\nThis will OVERWRITE the currently running script file:\n  ${XPRO_SELF_PATH}\n\nand immediately restart it. Continue?" 16 76; then
+        rm -f "${tmp_file}"
+        info "Update cancelled by operator."
+        return
+    fi
+
+    # Backup the current script before overwriting, same pattern as our
+    # config/DB writes — never destroy the only copy of something.
+    cp -p "${XPRO_SELF_PATH}" "${XPRO_BACKUP_DIR}/xpro.sh.$(date +%s).bak" 2>/dev/null || true
+
+    if ! install -m 755 "${tmp_file}" "${XPRO_SELF_PATH}"; then
+        rm -f "${tmp_file}"
+        dlg --title "Update failed" --msgbox "Failed to write the new script to ${XPRO_SELF_PATH} (permissions?). Nothing was changed beyond the backup." 9 70
+        return
+    fi
+    rm -f "${tmp_file}"
+
+    # Also refresh the /usr/local/bin/xpro shorthand copy if it exists and
+    # differs from the self path (i.e. we were invoked via that symlink/copy).
+    if [[ -f "${XPRO_INSTALLED_PATH}" && "${XPRO_INSTALLED_PATH}" != "${XPRO_SELF_PATH}" ]]; then
+        cp -p "${XPRO_SELF_PATH}" "${XPRO_INSTALLED_PATH}" 2>/dev/null || true
+        chmod 755 "${XPRO_INSTALLED_PATH}" 2>/dev/null || true
+    fi
+
+    clear
+    ok "Script updated (backup saved in ${XPRO_BACKUP_DIR}). Restarting..."
+    sleep 1
+    # Re-exec: replaces the current process image with the new script,
+    # preserving the same args, so the menu reopens seamlessly on the new
+    # version rather than requiring the operator to run the command again.
+    exec bash "${XPRO_SELF_PATH}" "${ORIGINAL_ARGS[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# Menu action: Uninstall
+# ---------------------------------------------------------------------------
+# Fully purges everything this script is responsible for. Deliberately does
+# NOT touch: curl/jq/uuid-runtime/unzip/openssl/qrencode/dialog packages
+# themselves (those are general-purpose system tools that may be used by
+# other things on the box), or the operator's SSH/firewall config. Scope is
+# strictly "everything xpro created", matching the spec.
+action_uninstall() {
+    if ! dlg --title "Uninstall xpro + Xray" --yesno "This will PERMANENTLY remove:\n\n  - Xray binary:        ${XRAY_BIN}\n  - Xray config dir:    ${XRAY_ETC_DIR}\n  - Xray logs:          ${XRAY_LOG_DIR}\n  - systemd unit:       ${XRAY_SYSTEMD_UNIT}\n  - xpro database/keys: ${XPRO_HOME}\n  - sweep timer/cron job\n  - xpro shorthand:     ${XPRO_INSTALLED_PATH}\n\nAll accounts and REALITY keys will be lost. This cannot be undone.\n\nProceed?" 20 76; then
+        info "Uninstall cancelled by operator."
+        return
+    fi
+
+    # Second confirmation via typed input — mirrors the "explicit
+    # confirmation" requirement used elsewhere for destructive/irreversible
+    # actions (see end_conversation-style confirm patterns): a single Yes/No
+    # dialog is easy to fat-finger through, so for full uninstall we also
+    # require typing the word DELETE.
+    local typed
+    typed="$(dlg --title "Final Confirmation" --inputbox "Type DELETE (all caps) to confirm total uninstall:" 9 60 3>&1 1>&2 2>&3)" \
+        || { info "Uninstall cancelled by operator."; return; }
+    if [[ "${typed}" != "DELETE" ]]; then
+        dlg --title "Uninstall cancelled" --msgbox "Confirmation text did not match. Nothing was removed." 8 56
+        return
+    fi
+
+    clear
+    info "Beginning full uninstall..."
+
+    # 1. Stop and disable the Xray service.
+    if systemctl list-unit-files 2>/dev/null | grep -q '^xray.service'; then
+        systemctl disable --now xray >/dev/null 2>&1 || true
+    fi
+
+    # 2. Remove the sweep timer/cron job.
+    remove_sweep_scheduler
+
+    # 3. Remove Xray binary, config, logs, systemd unit.
+    rm -f "${XRAY_BIN}"
+    rm -rf "${XRAY_ETC_DIR}"
+    rm -rf "${XRAY_LOG_DIR}"
+    rm -f "${XRAY_SYSTEMD_UNIT}"
+    systemctl daemon-reload 2>/dev/null || true
+
+    # 4. Remove xpro's own data directory (DB, keys, backups, logs, sweep
+    #    script). Done LAST and only after everything above succeeded, so a
+    #    failure partway through still leaves the DB available for a retry
+    #    or for manual inspection of what was/wasn't cleaned up.
+    rm -rf "${XPRO_HOME}"
+
+    # 5. Remove the /usr/local/bin/xpro shorthand, if present.
+    rm -f "${XPRO_INSTALLED_PATH}"
+
+    ok "Uninstall complete. Xray, its config, the local database, and all scheduled jobs have been removed."
+    echo
+    echo "Note: this script file itself (${XPRO_SELF_PATH}) was left in place — delete it manually if you wish."
+    pause
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# First-run installer
+# ---------------------------------------------------------------------------
+# Walks the operator through the one-time setup: port, camouflage
+# domain/SNI, binary install, REALITY keys, base config, systemd unit, and
+# the expiry sweep scheduler. Safe to re-run — every step is idempotent
+# (checks "is this already done" before doing it) except explicit
+# overwrites, which are gated behind their own confirmation.
+run_installer() {
+    local port dest sni answer
+
+    if xray_is_installed && [[ -f "${XRAY_CONFIG}" ]]; then
+        if ! dlg --title "Already installed" --yesno "Xray appears to already be installed and configured:\n\n  Binary:  ${XRAY_BIN} ($("${XRAY_BIN}" version 2>/dev/null | head -n1))\n  Config:  ${XRAY_CONFIG}\n\nRe-running setup will REGENERATE the base config (new REALITY keypair, new port/SNI if you change them) and DISCONNECT all existing clients until they're re-issued links. Continue?" 15 76; then
+            info "Setup cancelled — existing installation left untouched."
+            return
+        fi
+    fi
+
+    port="$(dlg --title "Listening Port" --inputbox "Port for the VLESS/REALITY inbound (443 strongly recommended — REALITY on a non-443 port is a known GFW fingerprinting signal):" 11 76 "${DEFAULT_PORT}" 3>&1 1>&2 2>&3)" \
+        || { info "Setup cancelled."; return; }
+    if ! valid_port "${port}"; then
+        dlg --title "Invalid port" --msgbox "Port must be a number between 1 and 65535." 8 56
+        return
+    fi
+
+    sni="$(dlg --title "Camouflage SNI" --inputbox "SNI / server name to impersonate (must be a real, reachable site serving modern TLS 1.3, e.g. www.microsoft.com):" 11 76 "${DEFAULT_SNI}" 3>&1 1>&2 2>&3)" \
+        || { info "Setup cancelled."; return; }
+    if [[ -z "${sni}" ]]; then
+        dlg --title "Invalid SNI" --msgbox "SNI cannot be empty." 8 50
+        return
+    fi
+    dest="${sni}:443"
+
+    if ! dlg --title "Confirm" --yesno "About to install/configure Xray with:\n\n  Port:        ${port}\n  Camouflage:  ${sni} (dest ${dest})\n  Protocol:    VLESS + XTLS-Vision + REALITY\n\nProceed?" 13 70; then
+        info "Setup cancelled by operator."
+        return
+    fi
+
+    clear
+    info "Starting installation..."
+
+    install_xray_binary
+    generate_reality_keys
+    generate_base_config "${port}" "${dest}" "${sni}" "$(reality_private_key)"
+    install_systemd_unit
+    db_init
+
+    if ! restart_xray; then
+        die "Initial xray.service start failed — see ${XPRO_LOG} and 'journalctl -u xray -n 50' before retrying setup."
+    fi
+
+    install_sweep_scheduler
+
+    # Install ourselves as /usr/local/bin/xpro for convenient future
+    # invocation (`sudo xpro`) regardless of where the script was originally
+    # downloaded to.
+    if [[ "${XPRO_SELF_PATH}" != "${XPRO_INSTALLED_PATH}" ]]; then
+        install -m 755 "${XPRO_SELF_PATH}" "${XPRO_INSTALLED_PATH}" 2>/dev/null \
+            && ok "Installed shorthand command: run 'sudo xpro' any time to reopen this menu."
+    fi
+
+    ok "Installation complete."
+    dlg --title "Setup Complete" --msgbox "Xray is installed and running on port ${port} with REALITY camouflage as ${sni}.\n\nUse 'Create Account' from the main menu to issue your first client.\n\nA daily expiry sweep has been scheduled automatically." 12 74
+}
+
+# ---------------------------------------------------------------------------
+# Status / diagnostics view
+# ---------------------------------------------------------------------------
+action_status() {
+    local svc_state timer_state user_count active_count port sni body pending_count
+
+    svc_state="$(systemctl is-active xray 2>/dev/null || echo "unknown")"
+    if systemctl list-unit-files 2>/dev/null | grep -q '^xpro-sweep.timer'; then
+        timer_state="$(systemctl is-active xpro-sweep.timer 2>/dev/null || echo "unknown")"
+    elif [[ -f "${XPRO_CRON_FALLBACK}" ]]; then
+        timer_state="cron.d fallback active"
+    else
+        timer_state="not installed"
+    fi
+
+    user_count="$(jq '.users | length' "${XPRO_DB}" 2>/dev/null || echo 0)"
+    active_count="$(jq '[.users[] | select(.enabled == true)] | length' "${XPRO_DB}" 2>/dev/null || echo 0)"
+    port="$(jq -r '.inbounds[0].port // "?"' "${XRAY_CONFIG}" 2>/dev/null)"
+    sni="$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // "?"' "${XRAY_CONFIG}" 2>/dev/null)"
+    # Preview of who the NEXT sweep run would disable, so an operator can
+    # sanity-check before the 03:30 UTC timer fires rather than being
+    # surprised by it.
+    pending_count="$(db_list_expired_enabled_users "$(now_iso)" | wc -l | tr -d ' ')"
+
+    body="Xray service:      ${svc_state}
+Sweep scheduler:   ${timer_state}
+Xray version:      $("${XRAY_BIN}" version 2>/dev/null | head -n1 || echo 'not installed')
+Listening port:    ${port}
+Camouflage SNI:    ${sni}
+Total accounts:    ${user_count}
+Active accounts:   ${active_count}
+Pending expiry:    ${pending_count} (will be swept at next daily run)
+Public IP:         $(detect_public_ip)
+Config path:       ${XRAY_CONFIG}
+Database path:     ${XPRO_DB}
+Log file:          ${XPRO_LOG}"
+
+    dlg --title "Status" --msgbox "${body}" 19 76
+}
+
+# ---------------------------------------------------------------------------
+# Main menu
+# ---------------------------------------------------------------------------
+main_menu() {
+    local choice
+    while true; do
+        choice="$(dlg --title "Main Menu" --cancel-label "Exit" --menu "Choose an action:" 20 72 11 \
+            "1" "Create Account" \
+            "2" "Delete Account" \
+            "3" "Extend Account" \
+            "4" "List Accounts" \
+            "5" "Show Account Link / QR" \
+            "6" "Status" \
+            "7" "Re-run Install / Reconfigure" \
+            "8" "Update Script" \
+            "9" "Uninstall Everything" \
+            "0" "Exit" \
+            3>&1 1>&2 2>&3)"
+
+        # Non-zero exit = Cancel/Esc pressed => treat as Exit.
+        if [[ $? -ne 0 ]]; then
+            break
+        fi
+
+        case "${choice}" in
+            1) action_create_account ;;
+            2) action_delete_account ;;
+            3) action_extend_account ;;
+            4) action_list_accounts ;;
+            5) action_show_link ;;
+            6) action_status ;;
+            7) run_installer ;;
+            8) action_update_script ;;
+            9) action_uninstall ;;
+            0) break ;;
+            *) : ;;
+        esac
+    done
+    clear
+    echo "Goodbye."
+}
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+xpro.sh v${XPRO_VERSION} — VLESS/XTLS-Vision/REALITY manager for Xray-core
+
+Usage:
+  sudo bash $0                Launch the interactive TUI (default).
+  sudo bash $0 --install      Run first-time setup non-interactively-ish
+                               (still uses dialog for the few required prompts).
+  sudo bash $0 --sweep        Run the expiry sweep once, immediately, in the
+                               foreground (same logic the daily timer runs).
+  sudo bash $0 --status       Print status and exit (no TUI).
+  sudo bash $0 --uninstall    Launch the uninstall flow directly.
+  sudo bash $0 --version      Print version and exit.
+  sudo bash $0 --help         Show this message.
+EOF
+}
+
+main() {
+    # Preserved so action_update_script can re-exec with the same invocation
+    # the operator originally used (e.g. `--install` if that's how they
+    # launched it), rather than always dropping back to the bare TUI.
+    ORIGINAL_ARGS=("$@")
+
+    require_root
+    require_ubuntu
+
+    # Logging directory must exist before the very first info()/warn() call
+    # that might fire during dependency checks.
+    mkdir -p "${XPRO_HOME}"
+    touch "${XPRO_LOG}" 2>/dev/null || true
+
+    check_dependencies
+    ensure_tui_backend
+    db_init
+
+    case "${1:-}" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --version|-v)
+            echo "xpro.sh v${XPRO_VERSION}"
+            exit 0
+            ;;
+        --install)
+            run_installer
+            exit 0
+            ;;
+        --sweep)
+            if [[ ! -x "${XPRO_SWEEP_SCRIPT}" ]]; then
+                die "Sweep script not found at ${XPRO_SWEEP_SCRIPT} — run --install first."
+            fi
+            "${XPRO_SWEEP_SCRIPT}"
+            exit $?
+            ;;
+        --status)
+            # Plain-text status for scripting/cron-mail use, bypassing dialog.
+            echo "Xray service:    $(systemctl is-active xray 2>/dev/null || echo unknown)"
+            echo "Xray version:    $("${XRAY_BIN}" version 2>/dev/null | head -n1 || echo 'not installed')"
+            echo "Total accounts:  $(jq '.users | length' "${XPRO_DB}" 2>/dev/null || echo 0)"
+            echo "Active accounts: $(jq '[.users[] | select(.enabled == true)] | length' "${XPRO_DB}" 2>/dev/null || echo 0)"
+            exit 0
+            ;;
+        --uninstall)
+            action_uninstall
+            exit 0
+            ;;
+        "")
+            : # fall through to interactive flow below
+            ;;
+        *)
+            echo "Unknown argument: ${1}" >&2
+            usage
+            exit 1
+            ;;
+    esac
+
+    # Interactive first run: if Xray isn't installed yet, walk through setup
+    # before dropping into the main menu, since every menu action assumes a
+    # working ${XRAY_CONFIG} and REALITY keys already exist.
+    if ! xray_is_installed || [[ ! -f "${XRAY_CONFIG}" ]]; then
+        if dlg --title "Welcome" --yesno "Xray does not appear to be installed yet.\n\nRun first-time setup now?" 9 60; then
+            run_installer
+        else
+            clear
+            echo "Nothing to do without an Xray installation. Run again and choose 'Yes' when ready, or use: sudo bash $0 --install"
+            exit 0
+        fi
+    fi
+
+    # If setup was declined/failed and config still doesn't exist, don't
+    # open a menu full of actions that would all immediately fail.
+    if [[ ! -f "${XRAY_CONFIG}" ]]; then
+        die "No Xray configuration found at ${XRAY_CONFIG} — cannot continue without completing setup."
+    fi
+
+    main_menu
 }
 
 main "$@"
