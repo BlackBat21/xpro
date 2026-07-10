@@ -569,6 +569,18 @@ cfg_write() {
 # Writes a brand-new base config with one VLESS/XTLS-Vision/REALITY inbound
 # and no clients yet. Clients are added afterwards via cfg_add_client so the
 # add-a-user code path is identical whether it's the 1st or 100th user.
+#
+# NOTE on shortIds seeding: current Xray-core (confirmed on v26.3.27) REJECTS
+# a REALITY inbound whose shortIds array is truly empty — config load fails
+# with 'infra/conf: empty "shortIds"'. Since a brand-new install legitimately
+# has zero users yet, we seed the array with a single "" (empty-string)
+# entry. Per REALITY's own semantics this technically means "clients with no
+# shortId are accepted" — but since clients[] is also empty at this point,
+# there is nobody who could authenticate anyway, so it's inert until the
+# first real user is added. cfg_add_client strips this placeholder the
+# moment a real shortId is inserted (see below), and cfg_remove_client
+# re-adds it if removing a user would otherwise leave shortIds empty again —
+# both to keep every write always immediately restart-safe.
 generate_base_config() {
     local port="$1" dest="$2" sni="$3" private_key="$4"
     install -d -m 755 "${XRAY_ETC_DIR}"
@@ -603,7 +615,7 @@ generate_base_config() {
                             xver: 0,
                             serverNames: [$sni],
                             privateKey: $priv,
-                            shortIds: []
+                            shortIds: [""]
                         }
                     },
                     sniffing: {
@@ -625,6 +637,11 @@ generate_base_config() {
 # Adds one client to the single inbound's clients[] AND its shortId to
 # shortIds[]. email is set to the username purely for human-readable
 # `xray api` / log correlation — it is NEVER used to store expiry.
+#
+# Also strips the "" placeholder shortId (seeded by generate_base_config so
+# a brand-new install has a non-empty, restart-safe shortIds array — see the
+# note there) the moment a real per-user shortId is being added, so the
+# array converges back to "real shortIds only" as soon as it safely can.
 cfg_add_client() {
     local username="$1" uuid="$2" short_id="$3"
     cfg_write '(.inbounds[0].settings.clients) += [{
@@ -632,7 +649,7 @@ cfg_add_client() {
             flow: "xtls-rprx-vision",
             email: $username
         }]
-        | (.inbounds[0].streamSettings.realitySettings.shortIds) += [$sid]' \
+        | (.inbounds[0].streamSettings.realitySettings.shortIds) |= (. + [$sid] | map(select(. != "")))' \
         --arg username "${username}" \
         --arg uuid "${uuid}" \
         --arg sid "${short_id}"
@@ -642,10 +659,21 @@ cfg_add_client() {
 # shortId from the DB (not the config) before calling this, then strip both
 # in one jq pass so config.json never has an orphaned shortId hanging around
 # unrelated to any live client.
+#
+# SAFETY: if removing this shortId would leave shortIds completely empty,
+# Xray-core refuses to load the config at all ('infra/conf: empty
+# "shortIds"', reproduced against v26.3.27) — which would silently break the
+# NEXT restart (including the unattended daily expiry sweep) for every
+# remaining/future user, not just this one. So we re-seed the same ""
+# placeholder used at install time whenever the array would otherwise go to
+# zero length, keeping every write self-contained and immediately
+# restart-safe regardless of how many users currently exist.
 cfg_remove_client() {
     local username="$1" short_id="$2"
     cfg_write '(.inbounds[0].settings.clients) |= map(select(.email != $username))
-        | (.inbounds[0].streamSettings.realitySettings.shortIds) |= map(select(. != $sid))' \
+        | (.inbounds[0].streamSettings.realitySettings.shortIds) |= (map(select(. != $sid)))
+        | (.inbounds[0].streamSettings.realitySettings.shortIds) |=
+            (if length == 0 then [""] else . end)' \
         --arg username "${username}" \
         --arg sid "${short_id}"
 }
@@ -1087,12 +1115,22 @@ fi
 # Also strip shortIds belonging ONLY to expired users. We look each one up
 # from the DB (source of truth) rather than trying to infer it from the
 # config, since the DB is guaranteed to have it recorded at creation time.
+#
+# SAFETY: Xray-core rejects a REALITY inbound with a completely empty
+# shortIds array ('infra/conf: empty "shortIds"', reproduced against
+# v26.3.27). If sweeping expired users would leave shortIds at zero length
+# (e.g. every remaining account expired in the same run), we re-seed the
+# same "" placeholder generate_base_config uses at install time — otherwise
+# this unattended sweep would write a config that then fails to (re)start,
+# taking the server down with nobody watching.
 short_ids_to_remove="$(jq -r --argjson names "${usernames_json}" \
     '.users[] | select(.username as $u | $names | index($u)) | .short_id' "${XPRO_DB}" | jq -R . | jq -s .)"
 
 config_tmp2="$(mktemp "$(dirname "${XRAY_CONFIG}")/.config.XXXXXX.json")"
 if ! jq --argjson sids "${short_ids_to_remove}" \
-    '(.inbounds[0].streamSettings.realitySettings.shortIds) |= map(select((. as $s | $sids | index($s)) | not))' \
+    '(.inbounds[0].streamSettings.realitySettings.shortIds) |= map(select((. as $s | $sids | index($s)) | not))
+     | (.inbounds[0].streamSettings.realitySettings.shortIds) |=
+         (if length == 0 then [""] else . end)' \
     "${config_tmp}" >"${config_tmp2}" 2>>"${XPRO_LOG}"; then
     log "ERROR: jq failed while stripping expired shortIds — aborting sweep, config untouched."
     rm -f "${config_tmp}" "${config_tmp2}"
