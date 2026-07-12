@@ -2,8 +2,14 @@
 #===============================================================================
 # xray-manager.sh
 #
-# Interactive manager for a VLESS + XTLS-Vision + REALITY proxy server built on
-# Xray-core (https://github.com/xtls/xray-core).
+# Interactive manager for an Xray-core proxy server supporting BOTH:
+#   * VLESS + XTLS-Vision + REALITY   (raw TCP)
+#   * VLESS + XHTTP + REALITY         (HTTP-multiplexed via fallback)
+#
+# Both protocols share ONE public port (default 443). Inbound 0 terminates
+# REALITY and, when it sees an HTTP request matching a secret randomized path,
+# falls back to a loopback Inbound 1 that speaks VLESS+XHTTP. This keeps a
+# single TLS fingerprint on the wire while multiplexing two transports.
 #
 # Target OS   : Ubuntu 24.04 LTS
 # Xray binary : /usr/local/bin/xray
@@ -14,7 +20,7 @@
 # Design notes:
 #   * Expiration data is kept OUT of the Xray config. The config only knows
 #     about currently-active clients. All lifecycle metadata (creation date,
-#     expiry timestamp, etc.) lives in the manager database (db.json).
+#     expiry timestamp, protocol, etc.) lives in the manager database.
 #   * ALL JSON edits go through `jq` so the Xray config can never be corrupted
 #     by naive string manipulation.
 #   * A systemd timer runs a daily reconciliation pass that strips expired
@@ -30,7 +36,7 @@ set -euo pipefail
 #===============================================================================
 # GLOBAL CONSTANTS
 #===============================================================================
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="2.0.0"
 readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
 # Placeholder self-update source — replace with your own raw GitHub URL.
@@ -52,6 +58,9 @@ readonly TIMER_UNIT_PATH="/etc/systemd/system/${TIMER_UNIT}"
 readonly DEFAULT_SNI="www.microsoft.com"
 readonly DEFAULT_DEST="www.microsoft.com:443"
 readonly DEFAULT_PORT="443"
+
+# Loopback port for the internal VLESS+XHTTP inbound (fallback destination).
+readonly DEFAULT_INTERNAL_PORT="8080"
 
 #===============================================================================
 # LOW-LEVEL HELPERS
@@ -83,6 +92,7 @@ ensure_dependencies() {
         [uuidgen]=uuid-runtime
         [whiptail]=whiptail
         [qrencode]=qrencode
+        [openssl]=openssl
     )
 
     local missing=()
@@ -138,6 +148,9 @@ generate_reality_keys() {
 # Random hex short-id (REALITY). 8 bytes -> 16 hex chars.
 generate_short_id() { openssl rand -hex 8; }
 
+# Random secret path for the XHTTP fallback. 8 bytes -> 16 hex chars, leading /.
+generate_xhttp_path() { echo "/$(openssl rand -hex 8)"; }
+
 # Best-effort public IPv4 discovery for building share links.
 detect_public_ip() {
     local ip
@@ -150,9 +163,10 @@ detect_public_ip() {
 #===============================================================================
 # INITIAL SERVER PROVISIONING
 #===============================================================================
-# Builds the REALITY inbound config from scratch and the manager DB. The DB's
-# "meta" object stores the server-wide parameters we need to reconstruct share
-# links later (public key, sni, port, short id, server ip).
+# Builds a TWO-inbound REALITY multiplexing config plus the manager DB. The
+# DB's "meta" object stores the server-wide parameters we need to reconstruct
+# share links later, including the internal XHTTP port and the randomized
+# fallback path.
 provision_server() {
     if [[ -f "${DB_FILE}" ]]; then
         log "Manager already provisioned (${DB_FILE} exists). Skipping."
@@ -170,22 +184,31 @@ provision_server() {
              --title "Server Setup" 3>&1 1>&2 2>&3)" || sni="${DEFAULT_SNI}"
     dest="${sni}:443"
 
-    # Generate cryptographic identity.
-    local keys priv pub short_id server_ip
+    # Generate cryptographic identity + stealth parameters.
+    local keys priv pub short_id server_ip internal_port xhttp_path
     keys="$(generate_reality_keys)"
     priv="${keys%% *}"
     pub="${keys##* }"
     short_id="$(generate_short_id)"
     server_ip="$(detect_public_ip)"
+    internal_port="${DEFAULT_INTERNAL_PORT}"
+    xhttp_path="$(generate_xhttp_path)"    # randomized secret fallback path
 
-    log "Writing Xray REALITY config -> ${XRAY_CONFIG}"
-    # The clients array starts empty; accounts are appended via jq later.
+    log "Writing Xray REALITY multiplexing config -> ${XRAY_CONFIG}"
+    # Inbound 0 (public):  VLESS + TCP + XTLS-Vision + REALITY, with a
+    #                      path-based fallback to the loopback XHTTP inbound.
+    # Inbound 1 (loopback): VLESS + XHTTP (no security; REALITY already
+    #                      terminated upstream). Its transport path MUST equal
+    #                      the fallback path above.
+    # Both clients arrays start empty; accounts are appended via jq later.
     jq -n \
-        --arg port "${port}" \
-        --arg dest "${dest}" \
-        --arg sni  "${sni}" \
-        --arg priv "${priv}" \
-        --arg sid  "${short_id}" \
+        --arg port   "${port}" \
+        --arg dest   "${dest}" \
+        --arg sni    "${sni}" \
+        --arg priv   "${priv}" \
+        --arg sid    "${short_id}" \
+        --arg iport  "${internal_port}" \
+        --arg xpath  "${xhttp_path}" \
         '{
           log: { loglevel: "warning" },
           inbounds: [
@@ -193,7 +216,13 @@ provision_server() {
               listen: "0.0.0.0",
               port: ($port | tonumber),
               protocol: "vless",
-              settings: { clients: [], decryption: "none" },
+              settings: {
+                clients: [],
+                decryption: "none",
+                fallbacks: [
+                  { path: $xpath, dest: ("127.0.0.1:" + $iport), xver: 0 }
+                ]
+              },
               streamSettings: {
                 network: "tcp",
                 security: "reality",
@@ -207,6 +236,22 @@ provision_server() {
                 }
               },
               sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
+            },
+            {
+              listen: "127.0.0.1",
+              port: ($iport | tonumber),
+              protocol: "vless",
+              settings: {
+                clients: [],
+                decryption: "none"
+              },
+              streamSettings: {
+                network: "xhttp",
+                xhttpSettings: {
+                  path: $xpath
+                }
+              },
+              sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
             }
           ],
           outbounds: [
@@ -217,18 +262,22 @@ provision_server() {
 
     log "Initializing manager database -> ${DB_FILE}"
     jq -n \
-        --arg ip   "${server_ip}" \
-        --arg port "${port}" \
-        --arg pub  "${pub}" \
-        --arg sni  "${sni}" \
-        --arg sid  "${short_id}" \
+        --arg ip     "${server_ip}" \
+        --arg port   "${port}" \
+        --arg pub    "${pub}" \
+        --arg sni    "${sni}" \
+        --arg sid    "${short_id}" \
+        --arg iport  "${internal_port}" \
+        --arg xpath  "${xhttp_path}" \
         '{
           meta: {
             server_ip: $ip,
             port: ($port | tonumber),
             public_key: $pub,
             sni: $sni,
-            short_id: $sid
+            short_id: $sid,
+            internal_port: ($iport | tonumber),
+            xhttp_path: $xpath
           },
           users: []
         }' > "${DB_FILE}"
@@ -237,7 +286,7 @@ provision_server() {
 
     systemctl enable "${XRAY_SERVICE}" >/dev/null 2>&1 || true
     restart_xray
-    log "Server provisioned successfully."
+    log "Server provisioned successfully (Vision + XHTTP fallback path: ${xhttp_path})."
 }
 
 #===============================================================================
@@ -262,29 +311,62 @@ ensure_provisioned() {
 }
 
 #===============================================================================
+# PROTOCOL RESOLUTION HELPERS
+#===============================================================================
+# Map a protocol name to its inbound index. vision -> 0, xhttp -> 1.
+# Unknown/empty protocols default to vision (index 0) for backwards compat.
+protocol_inbound_index() {
+    local protocol="${1:-vision}"
+    if [[ "${protocol}" == "xhttp" ]]; then echo 1; else echo 0; fi
+}
+
+# Read a user's protocol from the DB, defaulting to "vision" if the key is
+# absent (accounts created before XHTTP support existed).
+get_user_protocol() {
+    local username="$1" p
+    p="$(jq -r --arg u "${username}" \
+        '.users[] | select(.username==$u) | (.protocol // "vision")' "${DB_FILE}")"
+    [[ "${p}" == "xhttp" ]] && { echo "xhttp"; return; }
+    echo "vision"
+}
+
+#===============================================================================
 # SHARE LINK / QR GENERATION
 #===============================================================================
 # Rebuilds a standards-compliant VLESS REALITY URI from DB meta + a user record.
+# The transport section is conditional on the user's protocol:
+#   * vision -> type=tcp   + flow=xtls-rprx-vision
+#   * xhttp  -> type=xhttp + path=<randomized secret path> (no flow)
+# Both share the same REALITY params (pbk/sni/sid) because XHTTP rides the same
+# REALITY inbound via fallback.
 build_vless_link() {
-    local username="$1" uuid="$2"
-    local ip port pub sni sid
+    local username="$1" uuid="$2" protocol="${3:-vision}"
+    local ip port pub sni sid xpath xpath_enc
     ip="$(jq -r '.meta.server_ip' "${DB_FILE}")"
     port="$(jq -r '.meta.port' "${DB_FILE}")"
     pub="$(jq -r '.meta.public_key' "${DB_FILE}")"
     sni="$(jq -r '.meta.sni' "${DB_FILE}")"
     sid="$(jq -r '.meta.short_id' "${DB_FILE}")"
 
-    # flow=xtls-rprx-vision + security=reality + fp=chrome is the canonical combo.
-    printf 'vless://%s@%s:%s?type=tcp&security=reality&pbk=%s&fp=chrome&sni=%s&sid=%s&flow=xtls-rprx-vision&encryption=none#%s' \
-        "${uuid}" "${ip}" "${port}" "${pub}" "${sni}" "${sid}" "${username}"
+    if [[ "${protocol}" == "xhttp" ]]; then
+        xpath="$(jq -r '.meta.xhttp_path // "/"' "${DB_FILE}")"
+        # URL-encode the path so the "/" (and anything else) is link-safe.
+        xpath_enc="$(jq -rn --arg x "${xpath}" '$x | @uri')"
+        printf 'vless://%s@%s:%s?type=xhttp&security=reality&pbk=%s&fp=chrome&sni=%s&sid=%s&path=%s&mode=auto&encryption=none#%s' \
+            "${uuid}" "${ip}" "${port}" "${pub}" "${sni}" "${sid}" "${xpath_enc}" "${username}"
+    else
+        # flow=xtls-rprx-vision + security=reality + fp=chrome is the canonical combo.
+        printf 'vless://%s@%s:%s?type=tcp&security=reality&pbk=%s&fp=chrome&sni=%s&sid=%s&flow=xtls-rprx-vision&encryption=none#%s' \
+            "${uuid}" "${ip}" "${port}" "${pub}" "${sni}" "${sid}" "${username}"
+    fi
 }
 
 # Print the link plus an ASCII QR code to the terminal.
 show_share_details() {
-    local username="$1" uuid="$2" link
-    link="$(build_vless_link "${username}" "${uuid}")"
+    local username="$1" uuid="$2" protocol="${3:-vision}" link
+    link="$(build_vless_link "${username}" "${uuid}" "${protocol}")"
     echo
-    log "Account: ${username}"
+    log "Account: ${username}  [protocol: ${protocol}]"
     echo "VLESS Link:"
     echo "  ${link}"
     echo
@@ -324,22 +406,41 @@ user_exists() {
     [[ "$(jq --arg u "${username}" '[.users[] | select(.username==$u)] | length' "${DB_FILE}")" -gt 0 ]]
 }
 
-# Add a client to the live Xray config (email == username for correlation).
+# Add a client to the correct live Xray inbound (email == username for
+# correlation). Vision clients go to inbound[0] WITH the Vision flow; XHTTP
+# clients go to inbound[1] WITHOUT a flow (Vision only works over raw TCP).
 config_add_client() {
-    local username="$1" uuid="$2" new
-    new="$(jq --arg id "${uuid}" --arg email "${username}" \
-        '.inbounds[0].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision","email":$email}]' \
+    local username="$1" uuid="$2" protocol="${3:-vision}" new idx
+    idx="$(protocol_inbound_index "${protocol}")"
+    if [[ "${protocol}" == "xhttp" ]]; then
+        new="$(jq --arg id "${uuid}" --arg email "${username}" --argjson i "${idx}" \
+            '.inbounds[$i].settings.clients += [{"id":$id,"email":$email}]' \
+            "${XRAY_CONFIG}")"
+    else
+        new="$(jq --arg id "${uuid}" --arg email "${username}" --argjson i "${idx}" \
+            '.inbounds[$i].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision","email":$email}]' \
+            "${XRAY_CONFIG}")"
+    fi
+    atomic_write "${XRAY_CONFIG}" "${new}"
+}
+
+# Remove a client from the correct live Xray inbound by username/email.
+config_remove_client() {
+    local username="$1" protocol="${2:-vision}" new idx
+    idx="$(protocol_inbound_index "${protocol}")"
+    new="$(jq --arg email "${username}" --argjson i "${idx}" \
+        '.inbounds[$i].settings.clients |= map(select(.email != $email))' \
         "${XRAY_CONFIG}")"
     atomic_write "${XRAY_CONFIG}" "${new}"
 }
 
-# Remove a client from the live Xray config by username/email.
-config_remove_client() {
-    local username="$1" new
-    new="$(jq --arg email "${username}" \
-        '.inbounds[0].settings.clients |= map(select(.email != $email))' \
-        "${XRAY_CONFIG}")"
-    atomic_write "${XRAY_CONFIG}" "${new}"
+# Return 0 if a client with this email is present in its protocol's inbound.
+config_has_client() {
+    local username="$1" protocol="${2:-vision}" idx
+    idx="$(protocol_inbound_index "${protocol}")"
+    [[ "$(jq --arg email "${username}" --argjson i "${idx}" \
+        '[.inbounds[$i].settings.clients[] | select(.email==$email)] | length' \
+        "${XRAY_CONFIG}")" -gt 0 ]]
 }
 
 #===============================================================================
@@ -348,7 +449,7 @@ config_remove_client() {
 action_create() {
     ensure_provisioned
 
-    local username duration
+    local username duration protocol proto_choice
     username="$(whiptail --inputbox "Enter a username (letters, digits, _ - . only):" 8 60 \
                 --title "Create Account" 3>&1 1>&2 2>&3)" || return 0
     # Input validation: non-empty, safe charset.
@@ -360,6 +461,18 @@ action_create() {
         whiptail --msgbox "A user named '${username}' already exists." 8 60
         return 0
     fi
+
+    # Protocol selection: Vision (raw TCP) vs XHTTP (HTTP-multiplexed fallback).
+    proto_choice="$(whiptail --title "Create Account" \
+        --menu "Choose transport protocol:" 12 62 2 \
+        "1" "VLESS + XTLS-Vision (TCP)" \
+        "2" "VLESS + XHTTP (fallback)" \
+        3>&1 1>&2 2>&3)" || return 0
+    case "${proto_choice}" in
+        1) protocol="vision" ;;
+        2) protocol="xhttp" ;;
+        *) return 0 ;;
+    esac
 
     duration="$(whiptail --inputbox "Validity duration in days:" 8 60 "30" \
                 --title "Create Account" 3>&1 1>&2 2>&3)" || return 0
@@ -374,24 +487,25 @@ action_create() {
     created_ts="$(date +%s)"
     expires_ts="$(( created_ts + duration * 86400 ))"
 
-    # 1) Append client to the live config.
-    config_add_client "${username}" "${uuid}"
+    # 1) Append client to the correct live inbound.
+    config_add_client "${username}" "${uuid}" "${protocol}"
 
-    # 2) Record lifecycle metadata in the DB.
+    # 2) Record lifecycle metadata (including protocol) in the DB.
     local new_db
     new_db="$(jq \
         --arg u "${username}" \
         --arg id "${uuid}" \
+        --arg proto "${protocol}" \
         --argjson c "${created_ts}" \
         --argjson e "${expires_ts}" \
-        '.users += [{"username":$u,"uuid":$id,"created_ts":$c,"expires_ts":$e}]' \
+        '.users += [{"username":$u,"uuid":$id,"protocol":$proto,"created_ts":$c,"expires_ts":$e}]' \
         "${DB_FILE}")"
     atomic_write "${DB_FILE}" "${new_db}"
 
     # 3) Apply. If the restart fails, roll back both mutations.
     if ! restart_xray; then
         warn "Restart failed — rolling back creation of '${username}'."
-        config_remove_client "${username}"
+        config_remove_client "${username}" "${protocol}"
         atomic_write "${DB_FILE}" "$(jq --arg u "${username}" '.users |= map(select(.username != $u))' "${DB_FILE}")"
         restart_xray || true
         whiptail --msgbox "Failed to activate account. Rolled back." 8 60
@@ -400,7 +514,7 @@ action_create() {
 
     # 4) Present share details to the operator.
     clear
-    show_share_details "${username}" "${uuid}"
+    show_share_details "${username}" "${uuid}" "${protocol}"
     echo "Expires: $(date -d "@${expires_ts}" '+%Y-%m-%d %H:%M:%S')"
     read -rp "Press Enter to return to the menu..."
 }
@@ -410,9 +524,9 @@ action_create() {
 #===============================================================================
 
 # Build a whiptail --menu argument list from the DB users. Echoes tag/label
-# pairs: "username" "expires: <date>".
+# pairs: "username" "(<protocol>, expires <date>)".
 _user_menu_items() {
-    jq -r '.users[] | "\(.username)\t(expires \(.expires_ts | strftime("%Y-%m-%d")))"' "${DB_FILE}" \
+    jq -r '.users[] | "\(.username)\t(\(.protocol // "vision"), expires \(.expires_ts | strftime("%Y-%m-%d")))"' "${DB_FILE}" \
         | while IFS=$'\t' read -r name label; do
               printf '%s\n%s\n' "${name}" "${label}"
           done
@@ -433,14 +547,16 @@ pick_user() {
 
 action_delete() {
     ensure_provisioned
-    local username
+    local username protocol
     username="$(pick_user "Delete Account")" || return 0
     [[ -n "${username}" ]] || return 0
 
     whiptail --yesno "Permanently delete account '${username}'?" 8 60 || return 0
 
-    # Remove from config, then DB, then apply.
-    config_remove_client "${username}"
+    protocol="$(get_user_protocol "${username}")"
+
+    # Remove from the correct inbound, then DB, then apply.
+    config_remove_client "${username}" "${protocol}"
     atomic_write "${DB_FILE}" "$(jq --arg u "${username}" '.users |= map(select(.username != $u))' "${DB_FILE}")"
     restart_xray || warn "Service restart reported an issue."
 
@@ -478,13 +594,14 @@ action_extend() {
     atomic_write "${DB_FILE}" "${new_db}"
 
     # If the user had been stripped from the config due to prior expiry, put
-    # them back so the extension takes effect immediately.
-    local uuid in_config
+    # them back (into their protocol's inbound) so the extension takes effect
+    # immediately.
+    local uuid protocol
+    protocol="$(get_user_protocol "${username}")"
     uuid="$(jq -r --arg u "${username}" '.users[] | select(.username==$u) | .uuid' "${DB_FILE}")"
-    in_config="$(jq --arg email "${username}" '[.inbounds[0].settings.clients[] | select(.email==$email)] | length' "${XRAY_CONFIG}")"
-    if [[ "${in_config}" -eq 0 ]]; then
-        log "Re-adding previously-expired user '${username}' to config."
-        config_add_client "${username}" "${uuid}"
+    if ! config_has_client "${username}" "${protocol}"; then
+        log "Re-adding previously-expired user '${username}' (${protocol}) to config."
+        config_add_client "${username}" "${uuid}" "${protocol}"
         restart_xray || true
     fi
 
@@ -501,39 +618,44 @@ action_list() {
     local now table
     now="$(date +%s)"
     table="$(jq -r --argjson now "${now}" '
-        (["USERNAME","CREATED","EXPIRES","STATUS"] | @tsv),
+        (["USERNAME","PROTOCOL","CREATED","EXPIRES","STATUS"] | @tsv),
         (.users[] |
             [ .username,
+              (.protocol // "vision"),
               (.created_ts | strftime("%Y-%m-%d")),
               (.expires_ts | strftime("%Y-%m-%d")),
               (if .expires_ts > $now then "active" else "EXPIRED" end)
             ] | @tsv)
     ' "${DB_FILE}" | column -t -s$'\t')"
-    whiptail --title "Accounts" --msgbox "${table:-No accounts.}" 20 70
+    whiptail --title "Accounts" --msgbox "${table:-No accounts.}" 20 78
 }
 
 #===============================================================================
 # EXPIRY RECONCILIATION  (invoked by the systemd timer AND interactively)
 #===============================================================================
-# Strips every user whose expires_ts is in the past out of the live config.
-# The DB record is retained (marked expired implicitly by its timestamp) so the
-# account can be extended/reactivated later without losing its UUID history.
+# Strips every user whose expires_ts is in the past out of the live config,
+# targeting the correct inbound per the user's protocol. The DB record is
+# retained (marked expired implicitly by its timestamp) so the account can be
+# extended/reactivated later without losing its UUID history.
 reconcile_expired() {
     ensure_provisioned
-    local now expired changed=0
+    local now changed=0
     now="$(date +%s)"
 
-    # List usernames that are expired AND still present in the config.
+    # Emit "username<TAB>protocol" for every expired user; default vision.
     mapfile -t expired < <(jq -r --argjson now "${now}" \
-        '.users[] | select(.expires_ts <= $now) | .username' "${DB_FILE}")
+        '.users[] | select(.expires_ts <= $now) | "\(.username)\t\(.protocol // "vision")"' \
+        "${DB_FILE}")
 
-    for u in "${expired[@]:-}"; do
+    local line u proto
+    for line in "${expired[@]:-}"; do
+        [[ -z "${line}" ]] && continue
+        IFS=$'\t' read -r u proto <<<"${line}"
         [[ -z "${u}" ]] && continue
-        local present
-        present="$(jq --arg e "${u}" '[.inbounds[0].settings.clients[] | select(.email==$e)] | length' "${XRAY_CONFIG}")"
-        if [[ "${present}" -gt 0 ]]; then
-            log "Expiring user: ${u}"
-            config_remove_client "${u}"
+        [[ -z "${proto}" ]] && proto="vision"
+        if config_has_client "${u}" "${proto}"; then
+            log "Expiring user: ${u} (${proto})"
+            config_remove_client "${u}" "${proto}"
             changed=1
         fi
     done
@@ -645,7 +767,7 @@ action_install() {
     install_xray_core
     provision_server
     install_expiry_timer
-    whiptail --msgbox "Installation complete.\n\nUse 'Create Account' to add your first user." 10 60
+    whiptail --msgbox "Installation complete.\n\nUse 'Create Account' to add your first user (Vision or XHTTP)." 10 62
 }
 
 #===============================================================================
