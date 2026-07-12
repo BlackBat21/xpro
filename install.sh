@@ -298,10 +298,23 @@ show_share_details() {
 #===============================================================================
 
 # Write JSON to a file atomically (temp + mv) so a crash mid-write can't corrupt.
+# IMPORTANT: mktemp creates 0600 root:root files. If we mv that over the Xray
+# config, the service user ('nobody') loses read access and Xray fails to start
+# with "permission denied". So we create the temp file in the SAME directory
+# (keeps mv atomic on one filesystem) and re-apply the target's original mode
+# before moving. The Xray config must stay world-readable (0644); the manager
+# DB stays private (0600) because it holds UUIDs.
 atomic_write() {
-    local target="$1" content="$2" tmp
-    tmp="$(mktemp)"
+    local target="$1" content="$2" tmp mode
+    tmp="$(mktemp "${target}.XXXXXX")"
     printf '%s' "${content}" > "${tmp}"
+    # Preserve the existing file's permissions; default to 0644 for new files.
+    if [[ -f "${target}" ]]; then
+        mode="$(stat -c '%a' "${target}")"
+    else
+        mode="644"
+    fi
+    chmod "${mode}" "${tmp}"
     mv "${tmp}" "${target}"
 }
 
