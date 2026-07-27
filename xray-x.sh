@@ -43,7 +43,7 @@ pause() { echo; read -rp "Press ENTER to return to the menu..." _; }
 # ===========================================================================
 #  STATE PERSISTENCE
 # ===========================================================================
-load_state() { [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}"; }
+load_state() { [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}"; return 0; }
 save_state() {
     mkdir -p "${STATE_DIR}"
     cat > "${STATE_FILE}" <<EOF
