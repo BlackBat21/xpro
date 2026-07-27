@@ -189,7 +189,7 @@ issue_cert() {
         # acme.sh returns non-zero for a benign "already have a valid cert,
         # not due for renewal yet" skip, not just for real failures. Don't
         # treat that case as fatal — only die on genuine issuance errors.
-        if echo "${issue_out}" | grep -qi "Skipping\. Next renewal time is"; then
+        if echo "${issue_out}" | grep -qiE "Skipping[.,] Next renewal time is|Skip, Next"; then
             ok "Existing certificate for ${DOMAIN} is still valid; skipping re-issuance."
         else
             die "Certificate issuance failed. Verify port 80 reachability and DNS."
