@@ -69,7 +69,7 @@ install_prereqs() {
     apt-get update -y
     apt-get install -y \
         curl wget jq socat cron dnsutils ufw ca-certificates \
-        nginx unzip xxd
+        nginx unzip xxd git
     systemctl enable --now cron
 
     if ! nginx -V 2>&1 | grep -q -- 'http_v2_module'; then
@@ -85,22 +85,37 @@ install_prereqs() {
         bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install || true
     fi
 
-    if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
-        info "Installing acme.sh..."
+    # acme.sh install: avoid `curl https://get.acme.sh | sh`. On some hosts/
+    # states that installer leaves behind a broken/"fragmented" acme.sh copy
+    # that re-triggers its own bootstrap on every call and mangles flags into
+    # "Unknown parameter: ----issue" style errors (a known upstream quirk —
+    # see acmesh-official/acme.sh#3683). Cloning the repo and running its
+    # install.sh directly is more reliable and gives the same end result.
+    if [[ ! -x "${ACME_HOME}/acme.sh" ]] || ! "${ACME_HOME}/acme.sh" --issue --help >/dev/null 2>&1; then
+        if [[ -d "${ACME_HOME}" ]]; then
+            warn "Existing acme.sh install at ${ACME_HOME} looks broken; reinstalling cleanly..."
+            rm -rf "${ACME_HOME}"
+        fi
+        info "Installing acme.sh (clean clone)..."
         read -rp "Enter e-mail for ACME registration (Let's Encrypt): " ACME_EMAIL
         [[ -n "${ACME_EMAIL}" ]] || die "ACME e-mail cannot be empty."
-        curl -fsSL https://get.acme.sh | sh -s email="${ACME_EMAIL}" \
-            || die "acme.sh installer failed. Check network access to github.com/raw.githubusercontent.com."
+
+        local tmp_clone; tmp_clone="$(mktemp -d)"
+        git clone --depth 1 https://github.com/acmesh-official/acme.sh.git "${tmp_clone}" \
+            || die "Failed to clone acme.sh repo. Check network access to github.com."
+        (cd "${tmp_clone}" && ./acme.sh --install -m "${ACME_EMAIL}" --home "${ACME_HOME}") \
+            || die "acme.sh install.sh failed."
+        rm -rf "${tmp_clone}"
     fi
+
     # shellcheck disable=SC1090
     source "${ACME_HOME}/acme.sh.env" 2>/dev/null || true
 
-    # Verify acme.sh is actually a working, callable CLI (not a half-extracted
-    # installer tree). A broken install re-triggers its own bootstrap on every
-    # call, which silently no-ops real commands like --issue/--install-cert.
+    # Verify acme.sh is actually callable for real commands (not just --version,
+    # which can succeed even on a broken/fragmented install).
     [[ -x "${ACME_HOME}/acme.sh" ]] || die "acme.sh install did not produce an executable at ${ACME_HOME}/acme.sh."
-    "${ACME_HOME}/acme.sh" --version >/dev/null 2>&1 \
-        || die "acme.sh at ${ACME_HOME}/acme.sh is not runnable. Try: rm -rf ${ACME_HOME} && re-run this script."
+    "${ACME_HOME}/acme.sh" --issue --help >/dev/null 2>&1 \
+        || die "acme.sh at ${ACME_HOME}/acme.sh is still not runnable after reinstall. Try manually: rm -rf ${ACME_HOME} && re-run this script."
 
     mkdir -p "${XRAY_CONF_DIR}" "${CERT_DIR}" "${STATE_DIR}"
 }
