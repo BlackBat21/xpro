@@ -595,6 +595,21 @@ main_menu() {
 # ===========================================================================
 #  ENTRYPOINT
 # ===========================================================================
+# This is an INTERACTIVE menu script — it needs a real terminal on stdin.
+# Running it as `curl ... | bash` pipes the script text into stdin, leaving
+# no keyboard for `read`, so every prompt reads EOF and the script exits with
+# no output. Detect that and tell the user how to run it correctly.
+if [[ ! -t 0 ]]; then
+    echo -e "${RED}[x]${NC} No interactive terminal detected on stdin." >&2
+    echo    "    This looks like 'curl ... | bash', which cannot drive an" >&2
+    echo    "    interactive menu. Run it one of these ways instead:" >&2
+    echo >&2
+    echo    "      curl -fsSL <url>/xray-x.sh -o xray-x.sh && sudo bash xray-x.sh" >&2
+    echo    "    or:" >&2
+    echo    "      sudo bash <(curl -fsSL <url>/xray-x.sh)" >&2
+    exit 1
+fi
+
 load_state
 if ! is_provisioned; then
     provision
