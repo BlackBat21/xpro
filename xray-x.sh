@@ -177,8 +177,24 @@ issue_cert() {
     "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt \
         || die "Failed to set default ACME CA (letsencrypt)."
 
-    "${ACME_HOME}/acme.sh" --issue -d "${DOMAIN}" --standalone --keylength ec-256 --httpport 80 \
-        || die "Certificate issuance failed. Verify port 80 reachability and DNS."
+    local issue_out issue_rc
+    if issue_out="$("${ACME_HOME}/acme.sh" --issue -d "${DOMAIN}" --standalone --keylength ec-256 --httpport 80 2>&1)"; then
+        issue_rc=0
+    else
+        issue_rc=$?
+    fi
+    echo "${issue_out}"
+
+    if [[ ${issue_rc} -ne 0 ]]; then
+        # acme.sh returns non-zero for a benign "already have a valid cert,
+        # not due for renewal yet" skip, not just for real failures. Don't
+        # treat that case as fatal — only die on genuine issuance errors.
+        if echo "${issue_out}" | grep -qi "Skipping\. Next renewal time is"; then
+            ok "Existing certificate for ${DOMAIN} is still valid; skipping re-issuance."
+        else
+            die "Certificate issuance failed. Verify port 80 reachability and DNS."
+        fi
+    fi
 
     "${ACME_HOME}/acme.sh" --install-cert -d "${DOMAIN}" --ecc \
         --fullchain-file "${CERT_DIR}/${DOMAIN}.crt" \
