@@ -595,19 +595,26 @@ main_menu() {
 # ===========================================================================
 #  ENTRYPOINT
 # ===========================================================================
-# This is an INTERACTIVE menu script — it needs a real terminal on stdin.
-# Running it as `curl ... | bash` pipes the script text into stdin, leaving
-# no keyboard for `read`, so every prompt reads EOF and the script exits with
-# no output. Detect that and tell the user how to run it correctly.
+# This is an INTERACTIVE menu script — its prompts read from the terminal.
+# Two ways people accidentally break that:
+#   1) `curl ... | bash`     -> stdin is the pipe, no keyboard for `read`.
+#   2) `sudo bash <(curl..)` -> sudo can't read the caller's /dev/fd/NN, so
+#                               you get "bash: /dev/fd/63: No such file".
+# If stdin is not a TTY we try to reattach it to the controlling terminal
+# (/dev/tty). If that also fails, we explain both fixes and exit — instead of
+# silently doing nothing.
 if [[ ! -t 0 ]]; then
-    echo -e "${RED}[x]${NC} No interactive terminal detected on stdin." >&2
-    echo    "    This looks like 'curl ... | bash', which cannot drive an" >&2
-    echo    "    interactive menu. Run it one of these ways instead:" >&2
-    echo >&2
-    echo    "      curl -fsSL <url>/xray-x.sh -o xray-x.sh && sudo bash xray-x.sh" >&2
-    echo    "    or:" >&2
-    echo    "      sudo bash <(curl -fsSL <url>/xray-x.sh)" >&2
-    exit 1
+    if [[ -e /dev/tty ]] && exec < /dev/tty 2>/dev/null; then
+        : # stdin successfully reattached to the terminal — carry on.
+    else
+        echo -e "${RED}[x]${NC} No interactive terminal available on stdin." >&2
+        echo    "    Do NOT pipe this script or run it under sudo with <(...)." >&2
+        echo    "    You are already root here, so run it like this:" >&2
+        echo >&2
+        echo    "      curl -fsSL <url>/xray-x.sh -o xray-x.sh" >&2
+        echo    "      bash xray-x.sh" >&2
+        exit 1
+    fi
 fi
 
 load_state
