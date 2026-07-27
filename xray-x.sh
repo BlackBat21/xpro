@@ -160,6 +160,18 @@ domain_and_dns() {
 # ===========================================================================
 issue_cert() {
     info "Issuing TLS certificate for ${DOMAIN} via acme.sh (HTTP-01 standalone)..."
+
+    # Guard against a stale/broken acme.sh binary (known upstream issue where
+    # a corrupted install re-triggers its own installer and mangles flags
+    # into "Unknown parameter: ----issue" style errors). Fail fast here
+    # instead of burning through set-default-ca/issue/install-cert first.
+    if ! "${ACME_HOME}/acme.sh" --issue --help >/dev/null 2>&1; then
+        die "acme.sh at ${ACME_HOME}/acme.sh is broken (fails on --issue --help).
+    This usually means a stale acme.sh install is being reused.
+    Fix: rm -rf ${ACME_HOME} && re-run this script so install_prereqs()
+    performs a clean reinstall before certificate issuance."
+    fi
+
     systemctl stop nginx 2>/dev/null || true
 
     "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt \
