@@ -85,14 +85,23 @@ install_prereqs() {
         bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install || true
     fi
 
-    if [[ ! -f "${ACME_HOME}/acme.sh" ]]; then
+    if [[ ! -x "${ACME_HOME}/acme.sh" ]]; then
         info "Installing acme.sh..."
         read -rp "Enter e-mail for ACME registration (Let's Encrypt): " ACME_EMAIL
         [[ -n "${ACME_EMAIL}" ]] || die "ACME e-mail cannot be empty."
-        curl https://get.acme.sh | sh -s email="${ACME_EMAIL}"
+        curl -fsSL https://get.acme.sh | sh -s email="${ACME_EMAIL}" \
+            || die "acme.sh installer failed. Check network access to github.com/raw.githubusercontent.com."
     fi
     # shellcheck disable=SC1090
     source "${ACME_HOME}/acme.sh.env" 2>/dev/null || true
+
+    # Verify acme.sh is actually a working, callable CLI (not a half-extracted
+    # installer tree). A broken install re-triggers its own bootstrap on every
+    # call, which silently no-ops real commands like --issue/--install-cert.
+    [[ -x "${ACME_HOME}/acme.sh" ]] || die "acme.sh install did not produce an executable at ${ACME_HOME}/acme.sh."
+    "${ACME_HOME}/acme.sh" --version >/dev/null 2>&1 \
+        || die "acme.sh at ${ACME_HOME}/acme.sh is not runnable. Try: rm -rf ${ACME_HOME} && re-run this script."
+
     mkdir -p "${XRAY_CONF_DIR}" "${CERT_DIR}" "${STATE_DIR}"
 }
 
@@ -137,13 +146,23 @@ domain_and_dns() {
 issue_cert() {
     info "Issuing TLS certificate for ${DOMAIN} via acme.sh (HTTP-01 standalone)..."
     systemctl stop nginx 2>/dev/null || true
-    "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt
+
+    "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt \
+        || die "Failed to set default ACME CA (letsencrypt)."
+
     "${ACME_HOME}/acme.sh" --issue -d "${DOMAIN}" --standalone --keylength ec-256 --httpport 80 \
         || die "Certificate issuance failed. Verify port 80 reachability and DNS."
+
     "${ACME_HOME}/acme.sh" --install-cert -d "${DOMAIN}" --ecc \
         --fullchain-file "${CERT_DIR}/${DOMAIN}.crt" \
         --key-file       "${CERT_DIR}/${DOMAIN}.key" \
-        --reloadcmd      "systemctl reload nginx"
+        --reloadcmd      "systemctl reload nginx" \
+        || die "Failed to install issued certificate to ${CERT_DIR}."
+
+    # Sanity-check the files actually landed, not just that acme.sh returned 0.
+    [[ -s "${CERT_DIR}/${DOMAIN}.crt" && -s "${CERT_DIR}/${DOMAIN}.key" ]] \
+        || die "Certificate files missing after install-cert (${CERT_DIR}/${DOMAIN}.crt / .key)."
+
     "${ACME_HOME}/acme.sh" --install-cronjob >/dev/null 2>&1 || true
     ok "Certificate installed; auto-renewal cron configured (reloads nginx on renew)."
 }
@@ -360,7 +379,15 @@ apply_config() {
     build_xray_config
     build_nginx_config
     systemctl restart xray
-    systemctl reload nginx
+
+    # `reload` only works on an already-running service. issue_cert() stops
+    # nginx for standalone HTTP-01 validation and doesn't always leave it
+    # running afterward, so start it here if needed instead of assuming.
+    if systemctl is-active --quiet nginx; then
+        systemctl reload nginx || die "Nginx reload failed — check 'nginx -t' output above."
+    else
+        systemctl start nginx || die "Nginx failed to start. Run 'nginx -t' and 'journalctl -u nginx' to diagnose."
+    fi
 }
 
 # ===========================================================================
