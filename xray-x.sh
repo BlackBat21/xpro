@@ -178,7 +178,7 @@ issue_cert() {
         || die "Failed to set default ACME CA (letsencrypt)."
 
     local issue_out issue_rc
-    if issue_out="$("${ACME_HOME}/acme.sh" --issue -d "${DOMAIN}" --standalone --keylength ec-256 --httpport 80 2>&1)"; then
+    if issue_out="$("${ACME_HOME}/acme.sh" --issue -d "${DOMAIN}" --standalone --keylength ec-256 --httpport 80 --force 2>&1)"; then
         issue_rc=0
     else
         issue_rc=$?
