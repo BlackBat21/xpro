@@ -303,7 +303,7 @@ EOF
     # location generators (upstream port passed in)
     loc_ws() { cat <<EOF
     location ${WS_PATH} {
-        if (\$http_upgrade != "websocket") { return 404; }
+        if (\$http_upgrade !~* "websocket") { return 404; }
         proxy_pass http://127.0.0.1:$1;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -360,7 +360,6 @@ EOF
 server {
     listen 80;
     listen [::]:80;
-    listen 80 http2 default_server;
     server_name ${DOMAIN};
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
