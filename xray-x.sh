@@ -183,7 +183,7 @@ issue_cert() {
     "${ACME_HOME}/acme.sh" --install-cert -d "${DOMAIN}" --ecc \
         --fullchain-file "${CERT_DIR}/${DOMAIN}.crt" \
         --key-file       "${CERT_DIR}/${DOMAIN}.key" \
-        --reloadcmd      "systemctl reload nginx" \
+        --reloadcmd      "systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null || true" \
         || die "Failed to install issued certificate to ${CERT_DIR}."
 
     # Sanity-check the files actually landed, not just that acme.sh returned 0.
