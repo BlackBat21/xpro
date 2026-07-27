@@ -1,825 +1,602 @@
 #!/usr/bin/env bash
-#===============================================================================
-# xray-manager.sh
 #
-# Interactive manager for an Xray-core proxy server supporting BOTH:
-#   * VLESS + XTLS-Vision + REALITY   (raw TCP)
-#   * VLESS + XHTTP + REALITY         (HTTP-multiplexed via fallback)
-#
-# Both protocols share ONE public port (default 443). Inbound 0 terminates
-# REALITY and, when it sees an HTTP request matching a secret randomized path,
-# falls back to a loopback Inbound 1 that speaks VLESS+XHTTP. This keeps a
-# single TLS fingerprint on the wire while multiplexing two transports.
-#
-# Target OS   : Ubuntu 24.04 LTS
-# Xray binary : /usr/local/bin/xray
-# Xray config : /usr/local/etc/xray/config.json
-# Manager data: /etc/xray-manager/db.json
-# Service     : xray.service (systemd)
-#
-# Design notes:
-#   * Expiration data is kept OUT of the Xray config. The config only knows
-#     about currently-active clients. All lifecycle metadata (creation date,
-#     expiry timestamp, protocol, etc.) lives in the manager database.
-#   * ALL JSON edits go through `jq` so the Xray config can never be corrupted
-#     by naive string manipulation.
-#   * A systemd timer runs a daily reconciliation pass that strips expired
-#     users out of the live config.
-#===============================================================================
+# ============================================================================
+#  XRAY-X  |  VLESS Multi-Transport Manager  (menu-driven)
+#  Target OS  : Ubuntu 24.04 LTS (Noble Numbat)
+#  Engine     : Xray-core (VLESS)
+#  Transports : WebSocket + HTTP Upgrade + gRPC + XHTTP  (ALL AT ONCE)
+#  Routing    : Path-based fallback, single vhost on 80 (NTLS) / 443 (TLS)
+#  CDN Model  : Universal / provider-agnostic
+# ============================================================================
 
-# --- Strict mode -------------------------------------------------------------
-# -e : exit on unhandled error   -u : error on unset var   -o pipefail : catch
-# failures anywhere in a pipeline. Interactive whiptail cancels are handled
-# explicitly with `if ! ...` so they don't trip `set -e`.
 set -euo pipefail
 
-#===============================================================================
-# GLOBAL CONSTANTS
-#===============================================================================
-readonly SCRIPT_VERSION="2.0.0"
-readonly SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+# ---------------------------------------------------------------------------
+# 0. Globals & helpers
+# ---------------------------------------------------------------------------
+VERSION="1.0.0"
+XRAY_CONF_DIR="/usr/local/etc/xray"
+XRAY_CONF="${XRAY_CONF_DIR}/config.json"
+CERT_DIR="${XRAY_CONF_DIR}/certs"
+STATE_DIR="/etc/xray-x"
+STATE_FILE="${STATE_DIR}/state.env"        # persisted domain / paths / overrides
+ACCT_DB="${STATE_DIR}/accounts.db"         # username|uuid per line
+NGINX_SITE="/etc/nginx/sites-available/xray-x.conf"
+NGINX_LINK="/etc/nginx/sites-enabled/xray-x.conf"
+ACME_HOME="${HOME}/.acme.sh"
 
-# Placeholder self-update source — replace with your own raw GitHub URL.
-readonly UPDATE_URL="https://raw.githubusercontent.com/username/repo/main/script.sh"
+# Loopback port map: transport -> (TLS port, NTLS port)
+declare -A PORT_TLS=(  [ws]=10000 [httpupgrade]=10010 [grpc]=10020 [xhttp]=10030 )
+declare -A PORT_NTLS=( [ws]=10001 [httpupgrade]=10011 [grpc]=10021 [xhttp]=10031 )
+TRANSPORTS=(ws httpupgrade grpc xhttp)
 
-readonly XRAY_BIN="/usr/local/bin/xray"
-readonly XRAY_CONFIG="/usr/local/etc/xray/config.json"
-readonly XRAY_SERVICE="xray.service"
+RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'; CYN='\033[0;36m'
+BLU='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+info()  { echo -e "${CYN}[*]${NC} $*"; }
+ok()    { echo -e "${GRN}[+]${NC} $*"; }
+warn()  { echo -e "${YLW}[!]${NC} $*"; }
+die()   { echo -e "${RED}[x]${NC} $*" >&2; exit 1; }
+pause() { echo; read -rp "Press ENTER to return to the menu..." _; }
 
-readonly MANAGER_DIR="/etc/xray-manager"
-readonly DB_FILE="${MANAGER_DIR}/db.json"
+[[ $EUID -eq 0 ]] || die "This script must be run as root (use: sudo bash $0)."
 
-readonly TIMER_UNIT="xray-manager-expiry.timer"
-readonly TIMER_SERVICE="xray-manager-expiry.service"
-readonly TIMER_SERVICE_PATH="/etc/systemd/system/${TIMER_SERVICE}"
-readonly TIMER_UNIT_PATH="/etc/systemd/system/${TIMER_UNIT}"
-
-# Default REALITY camouflage target. Must be a TLSv1.3 + HTTP/2 capable host.
-readonly DEFAULT_SNI="www.microsoft.com"
-readonly DEFAULT_DEST="www.microsoft.com:443"
-readonly DEFAULT_PORT="443"
-
-# Loopback port for the internal VLESS+XHTTP inbound (fallback destination).
-readonly DEFAULT_INTERNAL_PORT="8080"
-
-#===============================================================================
-# LOW-LEVEL HELPERS
-#===============================================================================
-
-# Colored, timestamped logging to stderr (stdout stays clean for data output).
-log()  { echo -e "\033[1;32m[+]\033[0m $*" >&2; }
-warn() { echo -e "\033[1;33m[!]\033[0m $*" >&2; }
-err()  { echo -e "\033[1;31m[x]\033[0m $*" >&2; }
-
-# Abort with a message.
-die() { err "$*"; exit 1; }
-
-# Require root; almost everything here touches /usr/local and systemd.
-require_root() {
-    [[ "${EUID}" -eq 0 ]] || die "This script must be run as root (try: sudo $0)."
+# ===========================================================================
+#  STATE PERSISTENCE
+# ===========================================================================
+load_state() { [[ -f "${STATE_FILE}" ]] && source "${STATE_FILE}"; }
+save_state() {
+    mkdir -p "${STATE_DIR}"
+    cat > "${STATE_FILE}" <<EOF
+DOMAIN="${DOMAIN}"
+SNI_VALUE="${SNI_VALUE}"
+HOST_VALUE="${HOST_VALUE}"
+WS_PATH="${WS_PATH}"
+HU_PATH="${HU_PATH}"
+GRPC_SERVICE="${GRPC_SERVICE}"
+XH_PATH="${XH_PATH}"
+XH_MODE="${XH_MODE}"
+EOF
+    chmod 600 "${STATE_FILE}"
 }
+is_provisioned() { [[ -f "${STATE_FILE}" && -f "${CERT_DIR}/${DOMAIN:-__none__}.crt" ]]; }
 
-#===============================================================================
-# DEPENDENCY MANAGEMENT
-#===============================================================================
-# Ensure the tools we rely on exist. We map "command -> apt package" because a
-# couple of binaries live in differently-named packages (uuidgen -> uuid-runtime).
-ensure_dependencies() {
-    log "Checking dependencies..."
-    declare -A pkg_for=(
-        [curl]=curl
-        [jq]=jq
-        [uuidgen]=uuid-runtime
-        [whiptail]=whiptail
-        [qrencode]=qrencode
-        [openssl]=openssl
-    )
+# ===========================================================================
+# 1. PREREQUISITE & PACKAGE SETUP  (runs once, idempotent)
+# ===========================================================================
+install_prereqs() {
+    info "Updating system and installing base packages..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y \
+        curl wget jq socat cron dnsutils ufw ca-certificates \
+        nginx unzip xxd
+    systemctl enable --now cron
 
-    local missing=()
-    for cmd in "${!pkg_for[@]}"; do
-        if ! command -v "${cmd}" >/dev/null 2>&1; then
-            missing+=("${pkg_for[$cmd]}")
-        fi
-    done
+    if ! nginx -V 2>&1 | grep -q -- 'http_v2_module'; then
+        die "Nginx lacks http_v2_module — gRPC proxying impossible. Install nginx-full."
+    fi
 
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log "Installing missing packages: ${missing[*]}"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y "${missing[@]}"
+    # Xray-core (xhttp/httpupgrade need a recent release; installer pulls latest).
+    if ! command -v xray >/dev/null 2>&1; then
+        info "Installing Xray-core..."
+        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
     else
-        log "All dependencies satisfied."
-    fi
-}
-
-#===============================================================================
-# XRAY INSTALLATION
-#===============================================================================
-# Uses the official XTLS installer, which places the binary at
-# /usr/local/bin/xray, the config at /usr/local/etc/xray/config.json, and
-# installs a proper xray.service systemd unit — exactly matching our targets.
-install_xray_core() {
-    if [[ -x "${XRAY_BIN}" ]]; then
-        log "Xray already installed at ${XRAY_BIN} ($("${XRAY_BIN}" version | head -n1))."
-        return 0
-    fi
-    log "Installing Xray-core via official installer..."
-    bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-    [[ -x "${XRAY_BIN}" ]] || die "Xray installation failed."
-    log "Xray installed: $("${XRAY_BIN}" version | head -n1)"
-}
-
-#===============================================================================
-# REALITY KEY / IDENTITY HELPERS
-#===============================================================================
-
-# Generate a REALITY x25519 keypair. Prints "PRIVATE PUBLIC" on one line.
-# Parses robustly across Xray versions (labels have shifted between releases).
-generate_reality_keys() {
-    local out priv pub
-    out="$("${XRAY_BIN}" x25519)"
-    # Match "Private key:" / "PrivateKey:" and "Public key:" / "Password:".
-    priv="$(awk -F': *' 'tolower($0) ~ /private/ {print $2; exit}' <<<"${out}")"
-    pub="$(awk  -F': *' 'tolower($0) ~ /public|password/ {print $2; exit}' <<<"${out}")"
-    [[ -n "${priv}" && -n "${pub}" ]] || die "Failed to parse REALITY keys from: ${out}"
-    echo "${priv} ${pub}"
-}
-
-# Random hex short-id (REALITY). 8 bytes -> 16 hex chars.
-generate_short_id() { openssl rand -hex 8; }
-
-# Random secret path for the XHTTP fallback. 8 bytes -> 16 hex chars, leading /.
-generate_xhttp_path() { echo "/$(openssl rand -hex 8)"; }
-
-# Best-effort public IPv4 discovery for building share links.
-detect_public_ip() {
-    local ip
-    ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-    [[ -z "${ip}" ]] && ip="$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || true)"
-    [[ -z "${ip}" ]] && ip="$(hostname -I | awk '{print $1}')"
-    echo "${ip}"
-}
-
-#===============================================================================
-# INITIAL SERVER PROVISIONING
-#===============================================================================
-# Builds a TWO-inbound REALITY multiplexing config plus the manager DB. The
-# DB's "meta" object stores the server-wide parameters we need to reconstruct
-# share links later, including the internal XHTTP port and the randomized
-# fallback path.
-provision_server() {
-    if [[ -f "${DB_FILE}" ]]; then
-        log "Manager already provisioned (${DB_FILE} exists). Skipping."
-        return 0
+        info "Ensuring Xray-core is current..."
+        bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install || true
     fi
 
-    log "Provisioning REALITY server parameters..."
-    mkdir -p "${MANAGER_DIR}" "$(dirname "${XRAY_CONFIG}")"
-
-    # Collect server-wide settings from the operator (with sane defaults).
-    local port sni dest
-    port="$(whiptail --inputbox "Listening port for VLESS/REALITY:" 8 60 "${DEFAULT_PORT}" \
-             --title "Server Setup" 3>&1 1>&2 2>&3)" || port="${DEFAULT_PORT}"
-    sni="$(whiptail --inputbox "REALITY SNI / serverName (a real TLS1.3 site):" 8 60 "${DEFAULT_SNI}" \
-             --title "Server Setup" 3>&1 1>&2 2>&3)" || sni="${DEFAULT_SNI}"
-    dest="${sni}:443"
-
-    # Generate cryptographic identity + stealth parameters.
-    local keys priv pub short_id server_ip internal_port xhttp_path
-    keys="$(generate_reality_keys)"
-    priv="${keys%% *}"
-    pub="${keys##* }"
-    short_id="$(generate_short_id)"
-    server_ip="$(detect_public_ip)"
-    internal_port="${DEFAULT_INTERNAL_PORT}"
-    xhttp_path="$(generate_xhttp_path)"    # randomized secret fallback path
-
-    log "Writing Xray REALITY multiplexing config -> ${XRAY_CONFIG}"
-    # Inbound 0 (public):  VLESS + TCP + XTLS-Vision + REALITY, with a
-    #                      path-based fallback to the loopback XHTTP inbound.
-    # Inbound 1 (loopback): VLESS + XHTTP (no security; REALITY already
-    #                      terminated upstream). Its transport path MUST equal
-    #                      the fallback path above.
-    # Both clients arrays start empty; accounts are appended via jq later.
-    jq -n \
-        --arg port   "${port}" \
-        --arg dest   "${dest}" \
-        --arg sni    "${sni}" \
-        --arg priv   "${priv}" \
-        --arg sid    "${short_id}" \
-        --arg iport  "${internal_port}" \
-        --arg xpath  "${xhttp_path}" \
-        '{
-          log: { loglevel: "warning" },
-          inbounds: [
-            {
-              listen: "0.0.0.0",
-              port: ($port | tonumber),
-              protocol: "vless",
-              settings: {
-                clients: [],
-                decryption: "none",
-                fallbacks: [
-                  { path: $xpath, dest: ("127.0.0.1:" + $iport), xver: 0 }
-                ]
-              },
-              streamSettings: {
-                network: "tcp",
-                security: "reality",
-                realitySettings: {
-                  show: false,
-                  dest: $dest,
-                  xver: 0,
-                  serverNames: [$sni],
-                  privateKey: $priv,
-                  shortIds: [$sid]
-                }
-              },
-              sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
-            },
-            {
-              listen: "127.0.0.1",
-              port: ($iport | tonumber),
-              protocol: "vless",
-              settings: {
-                clients: [],
-                decryption: "none"
-              },
-              streamSettings: {
-                network: "xhttp",
-                xhttpSettings: {
-                  path: $xpath
-                }
-              },
-              sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
-            }
-          ],
-          outbounds: [
-            { protocol: "freedom", tag: "direct" },
-            { protocol: "blackhole", tag: "block" }
-          ]
-        }' > "${XRAY_CONFIG}"
-
-    log "Initializing manager database -> ${DB_FILE}"
-    jq -n \
-        --arg ip     "${server_ip}" \
-        --arg port   "${port}" \
-        --arg pub    "${pub}" \
-        --arg sni    "${sni}" \
-        --arg sid    "${short_id}" \
-        --arg iport  "${internal_port}" \
-        --arg xpath  "${xhttp_path}" \
-        '{
-          meta: {
-            server_ip: $ip,
-            port: ($port | tonumber),
-            public_key: $pub,
-            sni: $sni,
-            short_id: $sid,
-            internal_port: ($iport | tonumber),
-            xhttp_path: $xpath
-          },
-          users: []
-        }' > "${DB_FILE}"
-
-    chmod 600 "${DB_FILE}"          # DB holds UUIDs -> keep it private.
-
-    systemctl enable "${XRAY_SERVICE}" >/dev/null 2>&1 || true
-    restart_xray
-    log "Server provisioned successfully (Vision + XHTTP fallback path: ${xhttp_path})."
-}
-
-#===============================================================================
-# SERVICE + CONFIG SAFETY
-#===============================================================================
-
-# Validate the config, then (re)start Xray. If validation fails we refuse to
-# restart so a bad edit can never take the service down.
-restart_xray() {
-    if ! "${XRAY_BIN}" -test -config "${XRAY_CONFIG}" >/dev/null 2>&1; then
-        err "Xray config test FAILED — not restarting. Run: ${XRAY_BIN} -test -config ${XRAY_CONFIG}"
-        return 1
+    if [[ ! -f "${ACME_HOME}/acme.sh" ]]; then
+        info "Installing acme.sh..."
+        read -rp "Enter e-mail for ACME registration (Let's Encrypt): " ACME_EMAIL
+        [[ -n "${ACME_EMAIL}" ]] || die "ACME e-mail cannot be empty."
+        curl https://get.acme.sh | sh -s email="${ACME_EMAIL}"
     fi
-    systemctl restart "${XRAY_SERVICE}"
-    log "Xray service restarted."
+    # shellcheck disable=SC1090
+    source "${ACME_HOME}/acme.sh.env" 2>/dev/null || true
+    mkdir -p "${XRAY_CONF_DIR}" "${CERT_DIR}" "${STATE_DIR}"
 }
 
-# Guard used by every menu action that needs an existing installation.
-ensure_provisioned() {
-    [[ -f "${DB_FILE}" && -f "${XRAY_CONFIG}" ]] || \
-        die "Not provisioned yet. Run the installer first (menu option: Install / Provision)."
-}
+# ===========================================================================
+# 2. DOMAIN VERIFICATION & PRE-FLIGHT DNS CHECK
+# ===========================================================================
+domain_and_dns() {
+    read -rp "Enter your Fully Qualified Domain Name (FQDN, e.g. cdn.example.com): " DOMAIN
+    [[ -n "${DOMAIN}" ]] || die "Domain cannot be empty."
+    if [[ "${DOMAIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        die "Raw IP addresses are not allowed. A valid FQDN is required for TLS."
+    fi
 
-#===============================================================================
-# PROTOCOL RESOLUTION HELPERS
-#===============================================================================
-# Map a protocol name to its inbound index. vision -> 0, xhttp -> 1.
-# Unknown/empty protocols default to vision (index 0) for backwards compat.
-protocol_inbound_index() {
-    local protocol="${1:-vision}"
-    if [[ "${protocol}" == "xhttp" ]]; then echo 1; else echo 0; fi
-}
+    info "Determining server WAN IP..."
+    WAN_IP="$(curl -fsS4 https://api.ipify.org || curl -fsS4 https://ifconfig.me || true)"
+    [[ -n "${WAN_IP}" ]] || die "Unable to determine server WAN IP. Check connectivity."
+    ok "Server WAN IP: ${WAN_IP}"
 
-# Read a user's protocol from the DB, defaulting to "vision" if the key is
-# absent (accounts created before XHTTP support existed).
-get_user_protocol() {
-    local username="$1" p
-    p="$(jq -r --arg u "${username}" \
-        '.users[] | select(.username==$u) | (.protocol // "vision")' "${DB_FILE}")"
-    [[ "${p}" == "xhttp" ]] && { echo "xhttp"; return; }
-    echo "vision"
-}
+    info "Resolving A record for ${DOMAIN}..."
+    DNS_IP="$(dig +short A "${DOMAIN}" @1.1.1.1 | tail -n1)"
+    [[ -n "${DNS_IP}" ]] || die "No A record found for ${DOMAIN}. Configure DNS and wait for propagation."
+    ok "Resolved A record: ${DNS_IP}"
 
-#===============================================================================
-# SHARE LINK / QR GENERATION
-#===============================================================================
-# Rebuilds a standards-compliant VLESS REALITY URI from DB meta + a user record.
-# The transport section is conditional on the user's protocol:
-#   * vision -> type=tcp   + flow=xtls-rprx-vision
-#   * xhttp  -> type=xhttp + path=<randomized secret path> (no flow)
-# Both share the same REALITY params (pbk/sni/sid) because XHTTP rides the same
-# REALITY inbound via fallback.
-build_vless_link() {
-    local username="$1" uuid="$2" protocol="${3:-vision}"
-    local ip port pub sni sid xpath xpath_enc
-    ip="$(jq -r '.meta.server_ip' "${DB_FILE}")"
-    port="$(jq -r '.meta.port' "${DB_FILE}")"
-    pub="$(jq -r '.meta.public_key' "${DB_FILE}")"
-    sni="$(jq -r '.meta.sni' "${DB_FILE}")"
-    sid="$(jq -r '.meta.short_id' "${DB_FILE}")"
-
-    if [[ "${protocol}" == "xhttp" ]]; then
-        xpath="$(jq -r '.meta.xhttp_path // "/"' "${DB_FILE}")"
-        # URL-encode the path so the "/" (and anything else) is link-safe.
-        xpath_enc="$(jq -rn --arg x "${xpath}" '$x | @uri')"
-        printf 'vless://%s@%s:%s?type=xhttp&security=reality&pbk=%s&fp=chrome&sni=%s&sid=%s&path=%s&mode=auto&encryption=none#%s' \
-            "${uuid}" "${ip}" "${port}" "${pub}" "${sni}" "${sid}" "${xpath_enc}" "${username}"
+    if [[ "${DNS_IP}" != "${WAN_IP}" ]]; then
+        echo
+        warn "DNS MISMATCH DETECTED:"
+        warn "   Domain A record : ${DNS_IP}"
+        warn "   Server WAN IP   : ${WAN_IP}"
+        warn "If proxying through a CDN, the A record points to the CDN edge,"
+        warn "so acme.sh HTTP-01 validation will FAIL from this origin."
+        echo
+        read -rp "Proceed anyway (DNS-01 / temporarily grey-cloud)? [y/N]: " FORCE
+        [[ "${FORCE,,}" == "y" ]] || die "Aborting on DNS mismatch. Point A record at ${WAN_IP} for HTTP-01."
     else
-        # flow=xtls-rprx-vision + security=reality + fp=chrome is the canonical combo.
-        printf 'vless://%s@%s:%s?type=tcp&security=reality&pbk=%s&fp=chrome&sni=%s&sid=%s&flow=xtls-rprx-vision&encryption=none#%s' \
-            "${uuid}" "${ip}" "${port}" "${pub}" "${sni}" "${sid}" "${username}"
+        ok "Pre-flight DNS check passed: ${DOMAIN} -> ${WAN_IP}"
     fi
 }
 
-# Print the link plus an ASCII QR code to the terminal.
-show_share_details() {
-    local username="$1" uuid="$2" protocol="${3:-vision}" link
-    link="$(build_vless_link "${username}" "${uuid}" "${protocol}")"
-    echo
-    log "Account: ${username}  [protocol: ${protocol}]"
-    echo "VLESS Link:"
-    echo "  ${link}"
-    echo
-    echo "QR Code:"
-    qrencode -t ANSIUTF8 "${link}" || warn "qrencode failed to render QR."
-    echo
+# ===========================================================================
+# 3. SSL PROVISIONING & AUTO-RENEWAL (acme.sh)
+# ===========================================================================
+issue_cert() {
+    info "Issuing TLS certificate for ${DOMAIN} via acme.sh (HTTP-01 standalone)..."
+    systemctl stop nginx 2>/dev/null || true
+    "${ACME_HOME}/acme.sh" --set-default-ca --server letsencrypt
+    "${ACME_HOME}/acme.sh" --issue -d "${DOMAIN}" --standalone --keylength ec-256 --httpport 80 \
+        || die "Certificate issuance failed. Verify port 80 reachability and DNS."
+    "${ACME_HOME}/acme.sh" --install-cert -d "${DOMAIN}" --ecc \
+        --fullchain-file "${CERT_DIR}/${DOMAIN}.crt" \
+        --key-file       "${CERT_DIR}/${DOMAIN}.key" \
+        --reloadcmd      "systemctl reload nginx"
+    "${ACME_HOME}/acme.sh" --install-cronjob >/dev/null 2>&1 || true
+    ok "Certificate installed; auto-renewal cron configured (reloads nginx on renew)."
 }
 
-#===============================================================================
-# DATABASE + CONFIG MUTATIONS (all via jq, always paired atomically)
-#===============================================================================
-
-# Write JSON to a file atomically (temp + mv) so a crash mid-write can't corrupt.
-# IMPORTANT: mktemp creates 0600 root:root files. If we mv that over the Xray
-# config, the service user ('nobody') loses read access and Xray fails to start
-# with "permission denied". So we create the temp file in the SAME directory
-# (keeps mv atomic on one filesystem) and re-apply the target's original mode
-# before moving. The Xray config must stay world-readable (0644); the manager
-# DB stays private (0600) because it holds UUIDs.
-atomic_write() {
-    local target="$1" content="$2" tmp mode
-    tmp="$(mktemp "${target}.XXXXXX")"
-    printf '%s' "${content}" > "${tmp}"
-    # Preserve the existing file's permissions; default to 0644 for new files.
-    if [[ -f "${target}" ]]; then
-        mode="$(stat -c '%a' "${target}")"
-    else
-        mode="644"
+# ===========================================================================
+# 4. XRAY CONFIGURATION  — 8 inbounds (4 transports x TLS/NTLS)
+#     Rebuilt from the account DB every time accounts change.
+# ===========================================================================
+clients_json() {
+    # Emit the shared "clients" array from the account DB.
+    local first=1 out=""
+    if [[ -s "${ACCT_DB}" ]]; then
+        while IFS='|' read -r uname uuid; do
+            [[ -z "${uuid}" ]] && continue
+            [[ ${first} -eq 0 ]] && out+=","
+            out+=$(printf '\n            { "id": "%s", "email": "%s@%s" }' "${uuid}" "${uname}" "${DOMAIN}")
+            first=0
+        done < "${ACCT_DB}"
     fi
-    chmod "${mode}" "${tmp}"
-    mv "${tmp}" "${target}"
+    printf '%s' "${out}"
 }
 
-# Return 0 if a username already exists in the DB.
-user_exists() {
-    local username="$1"
-    [[ "$(jq --arg u "${username}" '[.users[] | select(.username==$u)] | length' "${DB_FILE}")" -gt 0 ]]
-}
-
-# Add a client to the correct live Xray inbound (email == username for
-# correlation). Vision clients go to inbound[0] WITH the Vision flow; XHTTP
-# clients go to inbound[1] WITHOUT a flow (Vision only works over raw TCP).
-config_add_client() {
-    local username="$1" uuid="$2" protocol="${3:-vision}" new idx
-    idx="$(protocol_inbound_index "${protocol}")"
-    if [[ "${protocol}" == "xhttp" ]]; then
-        new="$(jq --arg id "${uuid}" --arg email "${username}" --argjson i "${idx}" \
-            '.inbounds[$i].settings.clients += [{"id":$id,"email":$email}]' \
-            "${XRAY_CONFIG}")"
-    else
-        new="$(jq --arg id "${uuid}" --arg email "${username}" --argjson i "${idx}" \
-            '.inbounds[$i].settings.clients += [{"id":$id,"flow":"xtls-rprx-vision","email":$email}]' \
-            "${XRAY_CONFIG}")"
-    fi
-    atomic_write "${XRAY_CONFIG}" "${new}"
-}
-
-# Remove a client from the correct live Xray inbound by username/email.
-config_remove_client() {
-    local username="$1" protocol="${2:-vision}" new idx
-    idx="$(protocol_inbound_index "${protocol}")"
-    new="$(jq --arg email "${username}" --argjson i "${idx}" \
-        '.inbounds[$i].settings.clients |= map(select(.email != $email))' \
-        "${XRAY_CONFIG}")"
-    atomic_write "${XRAY_CONFIG}" "${new}"
-}
-
-# Return 0 if a client with this email is present in its protocol's inbound.
-config_has_client() {
-    local username="$1" protocol="${2:-vision}" idx
-    idx="$(protocol_inbound_index "${protocol}")"
-    [[ "$(jq --arg email "${username}" --argjson i "${idx}" \
-        '[.inbounds[$i].settings.clients[] | select(.email==$email)] | length' \
-        "${XRAY_CONFIG}")" -gt 0 ]]
-}
-
-#===============================================================================
-# MENU ACTION: CREATE ACCOUNT
-#===============================================================================
-action_create() {
-    ensure_provisioned
-
-    local username duration protocol proto_choice
-    username="$(whiptail --inputbox "Enter a username (letters, digits, _ - . only):" 8 60 \
-                --title "Create Account" 3>&1 1>&2 2>&3)" || return 0
-    # Input validation: non-empty, safe charset.
-    if [[ -z "${username}" || ! "${username}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-        whiptail --msgbox "Invalid username. Allowed: A-Z a-z 0-9 _ - ." 8 60
-        return 0
-    fi
-    if user_exists "${username}"; then
-        whiptail --msgbox "A user named '${username}' already exists." 8 60
-        return 0
-    fi
-
-    # Protocol selection: Vision (raw TCP) vs XHTTP (HTTP-multiplexed fallback).
-    proto_choice="$(whiptail --title "Create Account" \
-        --menu "Choose transport protocol:" 12 62 2 \
-        "1" "VLESS + XTLS-Vision (TCP)" \
-        "2" "VLESS + XHTTP (fallback)" \
-        3>&1 1>&2 2>&3)" || return 0
-    case "${proto_choice}" in
-        1) protocol="vision" ;;
-        2) protocol="xhttp" ;;
-        *) return 0 ;;
+stream_block() {
+    # $1 = transport
+    case "$1" in
+        ws)          printf '"network": "ws", "security": "none", "wsSettings": { "path": "%s", "headers": {} }' "${WS_PATH}" ;;
+        httpupgrade) printf '"network": "httpupgrade", "security": "none", "httpupgradeSettings": { "path": "%s", "host": "%s" }' "${HU_PATH}" "${HOST_VALUE}" ;;
+        grpc)        printf '"network": "grpc", "security": "none", "grpcSettings": { "serviceName": "%s", "multiMode": false }' "${GRPC_SERVICE}" ;;
+        xhttp)       printf '"network": "xhttp", "security": "none", "xhttpSettings": { "path": "%s", "host": "%s", "mode": "%s" }' "${XH_PATH}" "${HOST_VALUE}" "${XH_MODE}" ;;
     esac
-
-    duration="$(whiptail --inputbox "Validity duration in days:" 8 60 "30" \
-                --title "Create Account" 3>&1 1>&2 2>&3)" || return 0
-    if [[ ! "${duration}" =~ ^[0-9]+$ || "${duration}" -lt 1 ]]; then
-        whiptail --msgbox "Duration must be a positive integer." 8 60
-        return 0
-    fi
-
-    # Generate identity + compute timestamps.
-    local uuid created_ts expires_ts
-    uuid="$(uuidgen)"
-    created_ts="$(date +%s)"
-    expires_ts="$(( created_ts + duration * 86400 ))"
-
-    # 1) Append client to the correct live inbound.
-    config_add_client "${username}" "${uuid}" "${protocol}"
-
-    # 2) Record lifecycle metadata (including protocol) in the DB.
-    local new_db
-    new_db="$(jq \
-        --arg u "${username}" \
-        --arg id "${uuid}" \
-        --arg proto "${protocol}" \
-        --argjson c "${created_ts}" \
-        --argjson e "${expires_ts}" \
-        '.users += [{"username":$u,"uuid":$id,"protocol":$proto,"created_ts":$c,"expires_ts":$e}]' \
-        "${DB_FILE}")"
-    atomic_write "${DB_FILE}" "${new_db}"
-
-    # 3) Apply. If the restart fails, roll back both mutations.
-    if ! restart_xray; then
-        warn "Restart failed — rolling back creation of '${username}'."
-        config_remove_client "${username}" "${protocol}"
-        atomic_write "${DB_FILE}" "$(jq --arg u "${username}" '.users |= map(select(.username != $u))' "${DB_FILE}")"
-        restart_xray || true
-        whiptail --msgbox "Failed to activate account. Rolled back." 8 60
-        return 0
-    fi
-
-    # 4) Present share details to the operator.
-    clear
-    show_share_details "${username}" "${uuid}" "${protocol}"
-    echo "Expires: $(date -d "@${expires_ts}" '+%Y-%m-%d %H:%M:%S')"
-    read -rp "Press Enter to return to the menu..."
 }
 
-#===============================================================================
-# MENU ACTION: DELETE ACCOUNT
-#===============================================================================
+build_xray_config() {
+    local clients; clients="$(clients_json)"
+    local inbounds="" first=1 t sec port block
 
-# Build a whiptail --menu argument list from the DB users. Echoes tag/label
-# pairs: "username" "(<protocol>, expires <date>)".
-_user_menu_items() {
-    jq -r '.users[] | "\(.username)\t(\(.protocol // "vision"), expires \(.expires_ts | strftime("%Y-%m-%d")))"' "${DB_FILE}" \
-        | while IFS=$'\t' read -r name label; do
-              printf '%s\n%s\n' "${name}" "${label}"
-          done
-}
+    for t in "${TRANSPORTS[@]}"; do
+        for sec in tls ntls; do
+            if [[ "${sec}" == "tls" ]]; then port="${PORT_TLS[$t]}"; else port="${PORT_NTLS[$t]}"; fi
+            block="$(stream_block "$t")"
+            [[ ${first} -eq 0 ]] && inbounds+=","
+            inbounds+=$(cat <<EOF
 
-# Present a picker; echoes chosen username or empty on cancel/no-users.
-pick_user() {
-    local title="$1"
-    local count
-    count="$(jq '.users | length' "${DB_FILE}")"
-    if [[ "${count}" -eq 0 ]]; then
-        whiptail --msgbox "No accounts exist yet." 8 50
-        return 1
-    fi
-    mapfile -t items < <(_user_menu_items)
-    whiptail --title "${title}" --menu "Select an account:" 20 70 12 "${items[@]}" 3>&1 1>&2 2>&3
-}
-
-action_delete() {
-    ensure_provisioned
-    local username protocol
-    username="$(pick_user "Delete Account")" || return 0
-    [[ -n "${username}" ]] || return 0
-
-    whiptail --yesno "Permanently delete account '${username}'?" 8 60 || return 0
-
-    protocol="$(get_user_protocol "${username}")"
-
-    # Remove from the correct inbound, then DB, then apply.
-    config_remove_client "${username}" "${protocol}"
-    atomic_write "${DB_FILE}" "$(jq --arg u "${username}" '.users |= map(select(.username != $u))' "${DB_FILE}")"
-    restart_xray || warn "Service restart reported an issue."
-
-    whiptail --msgbox "Account '${username}' deleted." 8 50
-}
-
-#===============================================================================
-# MENU ACTION: EXTEND ACCOUNT
-#===============================================================================
-action_extend() {
-    ensure_provisioned
-    local username
-    username="$(pick_user "Extend Account")" || return 0
-    [[ -n "${username}" ]] || return 0
-
-    local add_days
-    add_days="$(whiptail --inputbox "Days to ADD to '${username}':" 8 60 "30" \
-                --title "Extend Account" 3>&1 1>&2 2>&3)" || return 0
-    if [[ ! "${add_days}" =~ ^[0-9]+$ || "${add_days}" -lt 1 ]]; then
-        whiptail --msgbox "Days must be a positive integer." 8 60
-        return 0
-    fi
-
-    # If already expired, extend from *now*; otherwise from the current expiry.
-    # This prevents "adding days" to a date in the past from staying expired.
-    local now new_db
-    now="$(date +%s)"
-    new_db="$(jq \
-        --arg u "${username}" \
-        --argjson add "$(( add_days * 86400 ))" \
-        --argjson now "${now}" \
-        '(.users[] | select(.username==$u) | .expires_ts) |=
-            ((if . > $now then . else $now end) + $add)' \
-        "${DB_FILE}")"
-    atomic_write "${DB_FILE}" "${new_db}"
-
-    # If the user had been stripped from the config due to prior expiry, put
-    # them back (into their protocol's inbound) so the extension takes effect
-    # immediately.
-    local uuid protocol
-    protocol="$(get_user_protocol "${username}")"
-    uuid="$(jq -r --arg u "${username}" '.users[] | select(.username==$u) | .uuid' "${DB_FILE}")"
-    if ! config_has_client "${username}" "${protocol}"; then
-        log "Re-adding previously-expired user '${username}' (${protocol}) to config."
-        config_add_client "${username}" "${uuid}" "${protocol}"
-        restart_xray || true
-    fi
-
-    local new_exp
-    new_exp="$(jq -r --arg u "${username}" '.users[] | select(.username==$u) | .expires_ts' "${DB_FILE}")"
-    whiptail --msgbox "Extended '${username}'.\nNew expiry: $(date -d "@${new_exp}" '+%Y-%m-%d %H:%M')" 9 60
-}
-
-#===============================================================================
-# MENU ACTION: LIST ACCOUNTS  (convenience view)
-#===============================================================================
-action_list() {
-    ensure_provisioned
-    local now table
-    now="$(date +%s)"
-    table="$(jq -r --argjson now "${now}" '
-        (["USERNAME","PROTOCOL","CREATED","EXPIRES","STATUS"] | @tsv),
-        (.users[] |
-            [ .username,
-              (.protocol // "vision"),
-              (.created_ts | strftime("%Y-%m-%d")),
-              (.expires_ts | strftime("%Y-%m-%d")),
-              (if .expires_ts > $now then "active" else "EXPIRED" end)
-            ] | @tsv)
-    ' "${DB_FILE}" | column -t -s$'\t')"
-    whiptail --title "Accounts" --msgbox "${table:-No accounts.}" 20 78
-}
-
-#===============================================================================
-# EXPIRY RECONCILIATION  (invoked by the systemd timer AND interactively)
-#===============================================================================
-# Strips every user whose expires_ts is in the past out of the live config,
-# targeting the correct inbound per the user's protocol. The DB record is
-# retained (marked expired implicitly by its timestamp) so the account can be
-# extended/reactivated later without losing its UUID history.
-reconcile_expired() {
-    ensure_provisioned
-    local now changed=0
-    now="$(date +%s)"
-
-    # Emit "username<TAB>protocol" for every expired user; default vision.
-    mapfile -t expired < <(jq -r --argjson now "${now}" \
-        '.users[] | select(.expires_ts <= $now) | "\(.username)\t\(.protocol // "vision")"' \
-        "${DB_FILE}")
-
-    local line u proto
-    for line in "${expired[@]:-}"; do
-        [[ -z "${line}" ]] && continue
-        IFS=$'\t' read -r u proto <<<"${line}"
-        [[ -z "${u}" ]] && continue
-        [[ -z "${proto}" ]] && proto="vision"
-        if config_has_client "${u}" "${proto}"; then
-            log "Expiring user: ${u} (${proto})"
-            config_remove_client "${u}" "${proto}"
-            changed=1
-        fi
+    {
+      "tag": "vless-${t}-${sec}",
+      "listen": "127.0.0.1",
+      "port": ${port},
+      "protocol": "vless",
+      "settings": {
+        "clients": [${clients}
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": { ${block} },
+      "sniffing": { "enabled": true, "destOverride": ["http", "tls"] }
+    }
+EOF
+)
+            first=0
+        done
     done
 
-    if [[ "${changed}" -eq 1 ]]; then
-        restart_xray || err "Reconcile: restart failed."
-        log "Expiry reconciliation applied."
+    cat > "${XRAY_CONF}" <<EOF
+{
+  "log": { "loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
+  "inbounds": [${inbounds}
+  ],
+  "outbounds": [
+    { "tag": "direct",  "protocol": "freedom",   "settings": {} },
+    { "tag": "blocked", "protocol": "blackhole", "settings": {} }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [ { "type": "field", "ip": ["geoip:private"], "outboundTag": "blocked" } ]
+  }
+}
+EOF
+
+    mkdir -p /var/log/xray
+    chown -R nobody:nogroup /var/log/xray 2>/dev/null || true
+    xray -test -config "${XRAY_CONF}" || die "Xray config test failed."
+}
+
+# ===========================================================================
+# 5. NGINX REVERSE PROXY  — path-based fallback for all 4 transports
+# ===========================================================================
+build_nginx_config() {
+    cat > /etc/nginx/conf.d/upgrade-map.conf <<'EOF'
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+EOF
+
+    # location generators (upstream port passed in)
+    loc_ws() { cat <<EOF
+    location ${WS_PATH} {
+        if (\$http_upgrade != "websocket") { return 404; }
+        proxy_pass http://127.0.0.1:$1;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s; proxy_send_timeout 300s; proxy_buffering off;
+    }
+EOF
+}
+    loc_hu() { cat <<EOF
+    location ${HU_PATH} {
+        proxy_pass http://127.0.0.1:$1;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 300s; proxy_send_timeout 300s; proxy_buffering off;
+    }
+EOF
+}
+    loc_grpc() { cat <<EOF
+    location /${GRPC_SERVICE} {
+        grpc_pass grpc://127.0.0.1:$1;
+        grpc_set_header Host \$host;
+        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_set_header X-Forwarded-Proto \$scheme;
+        grpc_read_timeout 300s; grpc_send_timeout 300s; grpc_socket_keepalive on;
+    }
+EOF
+}
+    loc_xh() { cat <<EOF
+    location ${XH_PATH} {
+        proxy_pass http://127.0.0.1:$1;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off; proxy_request_buffering off;
+        proxy_read_timeout 300s; proxy_send_timeout 300s; client_max_body_size 0;
+    }
+EOF
+}
+
+    cat > "${NGINX_SITE}" <<EOF
+# ---- Port 80 : NTLS (plaintext; edge TLS terminated at CDN). h2 for gRPC. ----
+server {
+    listen 80;
+    listen [::]:80;
+    listen 80 http2 default_server;
+    server_name ${DOMAIN};
+
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
+$(loc_ws   "${PORT_NTLS[ws]}")
+$(loc_hu   "${PORT_NTLS[httpupgrade]}")
+$(loc_grpc "${PORT_NTLS[grpc]}")
+$(loc_xh   "${PORT_NTLS[xhttp]}")
+
+    location / { return 200 "OK\n"; default_type text/plain; }
+}
+
+# ---- Port 443 : TLS (edge-to-origin TLS via acme.sh certificate) ----
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name ${DOMAIN};
+
+    ssl_certificate     ${CERT_DIR}/${DOMAIN}.crt;
+    ssl_certificate_key ${CERT_DIR}/${DOMAIN}.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1h;
+
+$(loc_ws   "${PORT_TLS[ws]}")
+$(loc_hu   "${PORT_TLS[httpupgrade]}")
+$(loc_grpc "${PORT_TLS[grpc]}")
+$(loc_xh   "${PORT_TLS[xhttp]}")
+
+    location / { return 200 "OK\n"; default_type text/plain; }
+}
+EOF
+
+    ln -sf "${NGINX_SITE}" "${NGINX_LINK}"
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+    nginx -t || die "Nginx configuration test failed."
+}
+
+# ===========================================================================
+# 6. SERVICE & FIREWALL ORCHESTRATION
+# ===========================================================================
+firewall_and_services() {
+    ufw allow 22/tcp  >/dev/null 2>&1 || true
+    ufw allow 80/tcp  >/dev/null 2>&1 || true
+    ufw allow 443/tcp >/dev/null 2>&1 || true
+    ufw --force enable >/dev/null 2>&1 || true
+
+    systemctl enable --now xray  >/dev/null 2>&1 || true
+    systemctl enable --now nginx >/dev/null 2>&1 || true
+    systemctl enable --now cron  >/dev/null 2>&1 || true
+    systemctl restart xray
+    systemctl restart nginx
+}
+
+apply_config() {
+    # Regenerate xray + nginx from current state/DB and reload.
+    build_xray_config
+    build_nginx_config
+    systemctl restart xray
+    systemctl reload nginx
+}
+
+# ===========================================================================
+#  FIRST-RUN PROVISIONING
+# ===========================================================================
+provision() {
+    clear
+    echo -e "${BOLD}${CYN}First-time setup — provisioning XRAY-X${NC}"
+    echo "------------------------------------------------------------"
+    install_prereqs
+    domain_and_dns
+
+    # Auto-generate per-transport paths / serviceName / mode
+    WS_PATH="/ws$(head -c 4 /dev/urandom | xxd -p)"
+    HU_PATH="/hu$(head -c 4 /dev/urandom | xxd -p)"
+    GRPC_SERVICE="grpc$(head -c 4 /dev/urandom | xxd -p)"
+    XH_PATH="/xh$(head -c 4 /dev/urandom | xxd -p)"
+    XH_MODE="auto"
+
+    echo
+    info "Optional CDN overrides (Enter = default to origin domain):"
+    read -rp "Custom SNI  [default: ${DOMAIN}]: " CUSTOM_SNI
+    read -rp "Custom Host [default: ${DOMAIN}]: " CUSTOM_HOST
+    SNI_VALUE="${CUSTOM_SNI:-${DOMAIN}}"
+    HOST_VALUE="${CUSTOM_HOST:-${DOMAIN}}"
+
+    issue_cert
+    save_state
+    : > "${ACCT_DB}"          # start with empty account DB
+    apply_config
+    firewall_and_services
+    ok "Provisioning complete. Domain: ${DOMAIN}"
+    pause
+}
+
+# ===========================================================================
+#  MENU ACTIONS
+# ===========================================================================
+print_client_urls() {
+    local uname="$1" uuid="$2"
+    local enc_ws enc_hu enc_svc enc_xh
+    enc_ws="$(printf '%s' "${WS_PATH}"  | jq -sRr @uri)"
+    enc_hu="$(printf '%s' "${HU_PATH}"  | jq -sRr @uri)"
+    enc_svc="$(printf '%s' "${GRPC_SERVICE}" | jq -sRr @uri)"
+    enc_xh="$(printf '%s' "${XH_PATH}"  | jq -sRr @uri)"
+
+    echo -e "${BOLD}Account: ${GRN}${uname}${NC}  |  UUID: ${uuid}"
+    echo "----------------------------------------------------------------------"
+    echo -e "${BOLD}${BLU}[ WebSocket ]${NC}"
+    echo "TLS : vless://${uuid}@${DOMAIN}:443?encryption=none&security=tls&type=ws&host=${HOST_VALUE}&sni=${SNI_VALUE}&path=${enc_ws}#${uname}-WS-TLS"
+    echo "NTLS: vless://${uuid}@${DOMAIN}:80?encryption=none&security=none&type=ws&host=${HOST_VALUE}&path=${enc_ws}#${uname}-WS-NTLS"
+    echo -e "${BOLD}${BLU}[ HTTP Upgrade ]${NC}"
+    echo "TLS : vless://${uuid}@${DOMAIN}:443?encryption=none&security=tls&type=httpupgrade&host=${HOST_VALUE}&sni=${SNI_VALUE}&path=${enc_hu}#${uname}-HU-TLS"
+    echo "NTLS: vless://${uuid}@${DOMAIN}:80?encryption=none&security=none&type=httpupgrade&host=${HOST_VALUE}&path=${enc_hu}#${uname}-HU-NTLS"
+    echo -e "${BOLD}${BLU}[ gRPC ]${NC}"
+    echo "TLS : vless://${uuid}@${DOMAIN}:443?encryption=none&security=tls&type=grpc&serviceName=${enc_svc}&mode=gun&host=${HOST_VALUE}&sni=${SNI_VALUE}#${uname}-gRPC-TLS"
+    echo "NTLS: vless://${uuid}@${DOMAIN}:80?encryption=none&security=none&type=grpc&serviceName=${enc_svc}&mode=gun&host=${HOST_VALUE}#${uname}-gRPC-NTLS"
+    echo -e "${BOLD}${BLU}[ XHTTP ]${NC}"
+    echo "TLS : vless://${uuid}@${DOMAIN}:443?encryption=none&security=tls&type=xhttp&mode=${XH_MODE}&host=${HOST_VALUE}&sni=${SNI_VALUE}&path=${enc_xh}#${uname}-XHTTP-TLS"
+    echo "NTLS: vless://${uuid}@${DOMAIN}:80?encryption=none&security=none&type=xhttp&mode=${XH_MODE}&host=${HOST_VALUE}&path=${enc_xh}#${uname}-XHTTP-NTLS"
+    echo "----------------------------------------------------------------------"
+}
+
+action_create() {
+    clear
+    echo -e "${BOLD}${CYN}Create Account — builds ALL 4 transports for one identity${NC}"
+    echo "------------------------------------------------------------"
+    read -rp "Username / remark: " UNAME
+    UNAME="${UNAME// /_}"
+    [[ -n "${UNAME}" ]] || { warn "Username cannot be empty."; pause; return; }
+    if grep -q "^${UNAME}|" "${ACCT_DB}" 2>/dev/null; then
+        warn "Account '${UNAME}' already exists."; pause; return
+    fi
+    local UUID; UUID="$(xray uuid)"
+    echo "${UNAME}|${UUID}" >> "${ACCT_DB}"
+
+    info "Rebuilding Xray config with new account and reloading..."
+    apply_config
+    ok "Account created across WebSocket, HTTP Upgrade, gRPC, and XHTTP."
+    echo
+    print_client_urls "${UNAME}" "${UUID}"
+    pause
+}
+
+action_list_delete() {
+    clear
+    echo -e "${BOLD}${CYN}Accounts${NC}"
+    echo "------------------------------------------------------------"
+    if [[ ! -s "${ACCT_DB}" ]]; then
+        warn "No accounts yet. Use 'Create Account' first."; pause; return
+    fi
+    local i=1; local -a names=()
+    while IFS='|' read -r uname uuid; do
+        [[ -z "${uname}" ]] && continue
+        printf "  %2d) %-20s %s\n" "${i}" "${uname}" "${uuid}"
+        names+=("${uname}"); ((i++))
+    done < "${ACCT_DB}"
+    echo "------------------------------------------------------------"
+    echo "  Enter a number to DELETE, 's' + number to SHOW URLs, ENTER to go back."
+    read -rp "  Select: " SEL
+    [[ -z "${SEL}" ]] && return
+
+    if [[ "${SEL}" =~ ^s([0-9]+)$ ]]; then
+        local idx="${BASH_REMATCH[1]}"
+        local target="${names[$((idx-1))]:-}"
+        [[ -z "${target}" ]] && { warn "Invalid selection."; pause; return; }
+        local uuid; uuid="$(grep "^${target}|" "${ACCT_DB}" | head -n1 | cut -d'|' -f2)"
+        clear; print_client_urls "${target}" "${uuid}"; pause; return
+    fi
+
+    if [[ "${SEL}" =~ ^[0-9]+$ ]]; then
+        local target="${names[$((SEL-1))]:-}"
+        [[ -z "${target}" ]] && { warn "Invalid selection."; pause; return; }
+        read -rp "  Delete account '${target}'? [y/N]: " C
+        [[ "${C,,}" == "y" ]] || return
+        grep -v "^${target}|" "${ACCT_DB}" > "${ACCT_DB}.tmp" || true
+        mv "${ACCT_DB}.tmp" "${ACCT_DB}"
+        apply_config
+        ok "Account '${target}' deleted from all transports."
+        pause
     else
-        log "Expiry reconciliation: nothing to do."
+        warn "Unrecognized input."; pause
     fi
 }
 
-#===============================================================================
-# SYSTEMD TIMER INSTALLATION  (daily expiry sweep)
-#===============================================================================
-# A systemd timer is preferred over cron: it's journald-logged, survives
-# missed runs (Persistent=true), and is trivially removable on uninstall.
-install_expiry_timer() {
-    log "Installing daily expiry timer..."
-
-    cat > "${TIMER_SERVICE_PATH}" <<EOF
-[Unit]
-Description=Xray Manager - expire stale accounts
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/env bash ${SCRIPT_PATH} --cron-expiry
-EOF
-
-    cat > "${TIMER_UNIT_PATH}" <<EOF
-[Unit]
-Description=Run Xray Manager expiry sweep daily
-
-[Timer]
-OnCalendar=*-*-* 04:00:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now "${TIMER_UNIT}"
-    log "Timer '${TIMER_UNIT}' installed (daily @ 04:00)."
-}
-
-#===============================================================================
-# MENU ACTION: SELF-UPDATE
-#===============================================================================
-action_update_script() {
-    whiptail --yesno "Fetch latest script from:\n${UPDATE_URL}\n\nOverwrite ${SCRIPT_PATH} and restart?" 12 70 || return 0
-
-    local tmp
-    tmp="$(mktemp)"
-    if ! curl -fsSL "${UPDATE_URL}" -o "${tmp}"; then
-        rm -f "${tmp}"
-        whiptail --msgbox "Download failed. Update aborted." 8 50
-        return 0
-    fi
-
-    # Sanity check: must look like a bash script before we trust it.
-    if ! head -n1 "${tmp}" | grep -qE '^#!.*(bash|sh)'; then
-        rm -f "${tmp}"
-        whiptail --msgbox "Downloaded file doesn't look like a shell script. Aborted." 8 60
-        return 0
-    fi
-
-    # Keep a backup, then replace and re-exec the new version.
-    cp -f "${SCRIPT_PATH}" "${SCRIPT_PATH}.bak"
-    install -m 0755 "${tmp}" "${SCRIPT_PATH}"
-    rm -f "${tmp}"
-    log "Script updated. Restarting..."
-    exec /usr/bin/env bash "${SCRIPT_PATH}"
-}
-
-#===============================================================================
-# MENU ACTION: UNINSTALL  (full purge)
-#===============================================================================
 action_uninstall() {
-    whiptail --yesno "This PURGES Xray, all accounts, config, the manager DB and the timer.\n\nAre you absolutely sure?" 12 70 || return 0
+    clear
+    echo -e "${BOLD}${RED}Uninstall XRAY-X${NC}"
+    echo "------------------------------------------------------------"
+    echo "  This will:"
+    echo "    - stop & remove Xray-core (official uninstaller)"
+    echo "    - remove the XRAY-X Nginx site + upgrade map"
+    echo "    - delete ${XRAY_CONF_DIR} (config + certs)"
+    echo "    - delete ${STATE_DIR} (state + accounts)"
+    echo "    - remove the acme.sh cert/renewal for ${DOMAIN:-<domain>}"
+    echo "  Nginx itself is kept (may be used by other sites)."
+    echo "------------------------------------------------------------"
+    read -rp "  Type 'UNINSTALL' to confirm: " C
+    [[ "${C}" == "UNINSTALL" ]] || { warn "Aborted."; pause; return; }
 
-    log "Stopping and removing systemd timer..."
-    systemctl disable --now "${TIMER_UNIT}" >/dev/null 2>&1 || true
-    rm -f "${TIMER_UNIT_PATH}" "${TIMER_SERVICE_PATH}"
+    info "Stopping services..."
+    systemctl stop xray 2>/dev/null || true
 
-    log "Removing any legacy cron entries created by this script..."
-    # Defensive: strip our marker line from root's crontab if it ever existed.
-    ( crontab -l 2>/dev/null | grep -v 'xray-manager' | crontab - ) 2>/dev/null || true
-
-    log "Uninstalling Xray-core..."
+    info "Removing Xray-core..."
     bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge \
-        || warn "Xray uninstaller returned non-zero (may already be gone)."
+        >/dev/null 2>&1 || true
 
-    log "Removing config and manager data..."
-    rm -rf "$(dirname "${XRAY_CONFIG}")" "${MANAGER_DIR}"
+    info "Removing Nginx site..."
+    rm -f "${NGINX_LINK}" "${NGINX_SITE}" /etc/nginx/conf.d/upgrade-map.conf
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || true
+    else
+        warn "Nginx config test failed after removal — check remaining sites."
+    fi
 
-    systemctl daemon-reload || true
-    whiptail --msgbox "Uninstall complete. The script file itself remains at:\n${SCRIPT_PATH}" 9 70
-    log "Done. Goodbye."
+    info "Revoking / removing acme.sh certificate..."
+    if [[ -n "${DOMAIN:-}" && -f "${ACME_HOME}/acme.sh" ]]; then
+        "${ACME_HOME}/acme.sh" --remove -d "${DOMAIN}" --ecc >/dev/null 2>&1 || true
+    fi
+
+    info "Deleting config, certs, and state..."
+    rm -rf "${XRAY_CONF_DIR}" "${STATE_DIR}" /var/log/xray
+
+    ok "XRAY-X uninstalled."
+    echo -e "  ${YLW}Note:${NC} UFW rules for 80/443 were left in place. Remove manually if unused:"
+    echo "        ufw delete allow 80/tcp ; ufw delete allow 443/tcp"
+    echo
+    read -rp "Press ENTER to exit..." _
     exit 0
 }
 
-#===============================================================================
-# INSTALL / PROVISION FLOW  (menu-triggered full setup)
-#===============================================================================
-action_install() {
-    ensure_dependencies
-    install_xray_core
-    provision_server
-    install_expiry_timer
-    whiptail --msgbox "Installation complete.\n\nUse 'Create Account' to add your first user (Vision or XHTTP)." 10 62
+action_service() {
+    clear
+    echo -e "${BOLD}${CYN}Service Status${NC}"
+    echo "------------------------------------------------------------"
+    for svc in xray nginx cron; do
+        if systemctl is-active --quiet "${svc}"; then
+            echo -e "  ${svc}: ${GRN}active${NC}"
+        else
+            echo -e "  ${svc}: ${RED}inactive${NC}"
+        fi
+    done
+    echo "------------------------------------------------------------"
+    read -rp "  Restart xray+nginx now? [y/N]: " C
+    if [[ "${C,,}" == "y" ]]; then
+        systemctl restart xray && systemctl restart nginx
+        ok "Services restarted."
+    fi
+    pause
 }
 
-#===============================================================================
-# MAIN MENU (TUI)
-#===============================================================================
+# ===========================================================================
+#  DASHBOARD / MAIN MENU
+# ===========================================================================
+header() {
+    load_state
+    local up acct_count xver
+    up="$(uptime -p 2>/dev/null | sed 's/^up //')"
+    acct_count="$( [[ -s "${ACCT_DB}" ]] && grep -c '|' "${ACCT_DB}" || echo 0 )"
+    xver="$(xray version 2>/dev/null | head -n1 | awk '{print $2}')"
+    clear
+    echo -e "${GRN}============================================================${NC}"
+    echo -e "${BOLD}          XRAY-X  v${VERSION}   |   Main Menu${NC}"
+    echo -e "${GRN}============================================================${NC}"
+    echo -e "  Domain   : ${CYN}${DOMAIN:-not set}${NC}"
+    echo -e "  Xray     : ${xver:-unknown}"
+    echo -e "  Accounts : ${acct_count}"
+    echo -e "  Uptime   : up ${up:-unknown}"
+    echo -e "${GRN}============================================================${NC}"
+}
+
 main_menu() {
     while true; do
-        local choice
-        choice="$(whiptail --title "Xray VLESS+REALITY Manager v${SCRIPT_VERSION}" \
-            --menu "Select an action:" 20 66 10 \
-            "1" "Install / Provision server" \
-            "2" "Create account" \
-            "3" "Delete account" \
-            "4" "Extend account" \
-            "5" "List accounts" \
-            "6" "Run expiry sweep now" \
-            "7" "Update this script" \
-            "8" "Uninstall everything" \
-            "9" "Exit" \
-            3>&1 1>&2 2>&3)" || break
-
-        case "${choice}" in
-            1) action_install ;;
-            2) action_create ;;
-            3) action_delete ;;
-            4) action_extend ;;
-            5) action_list ;;
-            6) reconcile_expired; whiptail --msgbox "Expiry sweep finished." 8 40 ;;
-            7) action_update_script ;;
-            8) action_uninstall ;;
-            9) break ;;
+        header
+        echo
+        echo -e "   ${GRN}1)${NC} Create Account   ${GRN}2)${NC} List / Delete Account"
+        echo -e "   ${GRN}3)${NC} Service Status   ${RED}x)${NC} Uninstall"
+        echo -e "   ${RED}0)${NC} Exit"
+        echo
+        read -rp "  Select option: " OPT
+        case "${OPT}" in
+            1) action_create ;;
+            2) action_list_delete ;;
+            3) action_service ;;
+            x|X) action_uninstall ;;
+            0) clear; ok "Bye."; exit 0 ;;
+            *) warn "Invalid option."; sleep 1 ;;
         esac
     done
-    clear
-    log "Exited manager."
 }
 
-#===============================================================================
-# ENTRYPOINT
-#===============================================================================
-main() {
-    require_root
-
-    # Non-interactive hook used by the systemd timer.
-    if [[ "${1:-}" == "--cron-expiry" ]]; then
-        reconcile_expired
-        exit 0
-    fi
-
-    # Interactive path.
-    ensure_dependencies   # guarantee whiptail/jq exist before we draw any TUI.
-    main_menu
-}
-
-main "$@"
+# ===========================================================================
+#  ENTRYPOINT
+# ===========================================================================
+load_state
+if ! is_provisioned; then
+    provision
+fi
+main_menu
