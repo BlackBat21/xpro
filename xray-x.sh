@@ -355,6 +355,27 @@ EOF
 EOF
 }
 
+    # --- nginx >= 1.25.1 uses the standalone `http2 on;` directive.
+    # --- Older builds only understand `listen ... http2;`.
+    local NGINX_VER NGINX_MAJ NGINX_MIN NGINX_PATCH
+    NGINX_VER="$(nginx -v 2>&1 | sed -n 's#.*nginx/\([0-9.]*\).*#\1#p')"
+    NGINX_MAJ="${NGINX_VER%%.*}"; NGINX_MAJ="${NGINX_MAJ:-0}"
+    NGINX_MIN="$(echo "${NGINX_VER}" | cut -d. -f2)"; NGINX_MIN="${NGINX_MIN:-0}"
+    NGINX_PATCH="$(echo "${NGINX_VER}" | cut -d. -f3)"; NGINX_PATCH="${NGINX_PATCH:-0}"
+
+    local LISTEN_443_V4 LISTEN_443_V6 HTTP2_DIRECTIVE
+    if [ "${NGINX_MAJ}" -gt 1 ] 2>/dev/null || \
+       { [ "${NGINX_MAJ}" -eq 1 ] && [ "${NGINX_MIN}" -gt 25 ]; } || \
+       { [ "${NGINX_MAJ}" -eq 1 ] && [ "${NGINX_MIN}" -eq 25 ] && [ "${NGINX_PATCH}" -ge 1 ]; }; then
+        LISTEN_443_V4="listen 443 ssl;"
+        LISTEN_443_V6="listen [::]:443 ssl;"
+        HTTP2_DIRECTIVE="    http2 on;"
+    else
+        LISTEN_443_V4="listen 443 ssl http2;"
+        LISTEN_443_V6="listen [::]:443 ssl http2;"
+        HTTP2_DIRECTIVE=""
+    fi
+
     cat > "${NGINX_SITE}" <<EOF
 # ---- Port 80 : NTLS (plaintext; edge TLS terminated at CDN). h2 for gRPC. ----
 server {
@@ -374,9 +395,9 @@ $(loc_xh   "${PORT_NTLS[xhttp]}")
 
 # ---- Port 443 : TLS (edge-to-origin TLS via acme.sh certificate) ----
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    ${LISTEN_443_V4}
+    ${LISTEN_443_V6}
+${HTTP2_DIRECTIVE}
     server_name ${DOMAIN};
 
     ssl_certificate     ${CERT_DIR}/${DOMAIN}.crt;
